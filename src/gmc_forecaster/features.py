@@ -14,7 +14,7 @@ gmc_features.py — из истории отчётов строит матриц
 
 from __future__ import annotations
 import pandas as pd
-from parser_flat import parse_report_flat as parse_report
+from .parser_flat import parse_report_flat as parse_report
 
 IMAGE_DECAY = 0.5  # λ распада имидж-рекламы; подбирается по данным
 
@@ -70,21 +70,3 @@ FEATURES = [
     "cum_major",
     "minor_since",
 ]
-
-if __name__ == "__main__":
-    import sys
-
-    df = build_features(sys.argv[1:])
-    print(
-        df[
-            [
-                "channel",
-                "product",
-                "year",
-                "quarter",
-                "demand",
-                *FEATURES,
-                "demand_next",
-            ]
-        ].to_string(index=False)
-    )

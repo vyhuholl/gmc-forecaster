@@ -1,7 +1,7 @@
 [project]
 name = "gmc-forecaster"
 version = "0.1.0"
-description = "Add your description here"
+description = "Двухшаговая модель доля-рынка/спрос для Global Management Challenge"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -10,6 +10,16 @@ dependencies = [
     "scikit-learn>=1.9.0",
     "xlrd>=2.0.2",
 ]
+
+[project.scripts]
+gmc-forecaster = "gmc_forecaster.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [dependency-groups]
 dev = [
@@ -27,6 +37,8 @@ line-length = 79
 [tool.mypy]
 python_version = "3.14"
 strict = true
+mypy_path = "src"
+explicit_package_bases = true
 
 [[tool.mypy.overrides]]
 module = ["sklearn", "sklearn.*"]

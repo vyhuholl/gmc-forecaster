@@ -180,12 +180,3 @@ def parse_report_flat(path: str) -> tuple[dict[str, Any], pd.DataFrame]:
     for k in ("year", "quarter", "company", "group"):
         df[k] = meta[k]
     return meta, df
-
-
-if __name__ == "__main__":
-    import sys
-    import json
-
-    meta, df = parse_report_flat(sys.argv[1])
-    print(json.dumps(meta, ensure_ascii=False, indent=2))
-    print(df.to_string(index=False))

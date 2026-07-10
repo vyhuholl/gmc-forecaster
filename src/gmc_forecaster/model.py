@@ -78,19 +78,3 @@ def backtest(
         "MAPE_growth": round(_mape(y, naive_growth), 1),
         "coef": {k: round(v, 3) for k, v in m.coef_.items()},
     }, te.assign(pred=pred.round(0), truth=y)
-
-
-if __name__ == "__main__":
-    import sys
-    from features import build_features
-
-    df = build_features(sys.argv[1:])
-    res, detail = backtest(df, holdout_quarter=3)  # предсказываем Q3->Q4
-    for k, v in res.items():
-        print(f"{k}: {v}")
-    print("\nпо ячейкам (truth vs pred):")
-    print(
-        detail[["channel", "product", "lag1", "truth", "pred"]].to_string(
-            index=False
-        )
-    )

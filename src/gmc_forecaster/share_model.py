@@ -21,7 +21,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
-from parser_flat import SCHEMA as S, CH, _num, _stars
+from .parser_flat import SCHEMA as S, CH, _num, _stars
 
 __all__ = [
     "load_panel",
@@ -138,7 +138,7 @@ def fit_seasonality(hst_paths: list[str]) -> dict[int, float]:
     Возвращает {квартал: множитель}, нормированный к среднему геометрическому 1.
     """
     import math
-    from parser_flat import parse_report_flat
+    from .parser_flat import parse_report_flat
 
     d = pd.concat(
         [parse_report_flat(f)[1] for f in hst_paths], ignore_index=True
@@ -226,72 +226,3 @@ def predict_demand(
         if vol is None
         else round(own_share_pred / 100 * vol, 0),
     }
-
-
-if __name__ == "__main__":
-    import sys
-
-    args = sys.argv[1:]
-    hst = [p for p in args if "Hst" in p]  # history группы 0 -> сезонность
-    panel_files = [p for p in args if p not in hst]
-    panel = load_panel(panel_files)
-    m = ShareModel().fit(panel)
-    print(f"Стадия 1 (логит доли): n={m.n}  R²={m.r2:.3f}")
-    print("Коэффициенты (полезность логита):")
-    for k in FEATURES:
-        print(f"   {k:12} = {m.coef_[k]:+.3f}")
-    print(
-        "Групповые эффекты:",
-        {k: round(v, 3) for k, v in m.coef_.items() if k.startswith("g_")},
-    )
-    print(
-        f"Собств. эластичность доли по цене при s=8%: {m.price_elasticity(8):.2f}"
-    )
-
-    seas = fit_seasonality(hst) if hst else None
-    if seas:
-        print(
-            "\nСезонные факторы объёма (группа 0):",
-            {q: round(v, 3) for q, v in seas.items()},
-        )
-
-    # демо-контрфактик: первая ячейка последнего файла, +10% к цене компании 1
-    last = panel[panel["gq"] == panel["gq"].iloc[-1]]
-    cell = last[last["cell"] == last["cell"].iloc[0]]
-    print(
-        f"\nКонтрфактик (ячейка {cell['cell'].iloc[0]}, группа {cell['group'].iloc[0]}): "
-        f"компания 1 поднимает цену на 10%"
-    )
-    print(
-        counterfactual(m, cell, company=1, price_mult=1.10).to_string(
-            index=False
-        )
-    )
-
-    # стадия 2 со сезонностью: спрос компании 1, прогноз с текущего кв. на следующий
-    from parser_flat import parse_report_flat
-
-    meta, own = parse_report_flat(panel_files[-1])
-    qn = meta["quarter"]
-    qnext = qn % 4 + 1
-    r = own[
-        (own["channel"] == cell["channel"].iloc[0])
-        & (own["product"] == int(cell["product"].iloc[0]))
-    ]
-    sold = float(r["sold"].iloc[0]) if len(r) else 500.0
-    sh_now = float(cell[cell["company"] == 1]["share"].iloc[0])
-    flat = predict_demand(m, cell, 1, sold, sh_now, 1.00)
-    seasoned = predict_demand(
-        m,
-        cell,
-        1,
-        sold,
-        sh_now,
-        1.00,
-        seasonality=seas,
-        quarter_now=qn,
-        quarter_next=qnext,
-    )
-    print(f"\nСтадия 2, спрос компании 1 (Q{qn}->Q{qnext}):")
-    print(f"   без сезонности: {flat}")
-    print(f"   с сезонностью : {seasoned}")
