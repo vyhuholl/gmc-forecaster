@@ -1,0 +1,33 @@
+[project]
+name = "gmc-forecaster"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openpyxl>=3.1.5",
+    "pandas>=3.0.3",
+    "scikit-learn>=1.9.0",
+    "xlrd>=2.0.2",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.2.0",
+    "pandas-stubs>=3.0.3.260530",
+    "ruff>=0.15.21",
+    "types-openpyxl>=3.1.5.20260518",
+    "types-xlrd>=2.0.0.20260518",
+]
+
+[tool.ruff]
+fix = true
+line-length = 79
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["sklearn", "sklearn.*"]
+ignore_missing_imports = true

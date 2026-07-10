@@ -1,0 +1,11 @@
+repos:
+
+- repo: local
+
+  hooks:
+    - id: validate
+      name: validate
+      entry: make validate
+      language: system
+      types: [python]
+      require_serial: true
