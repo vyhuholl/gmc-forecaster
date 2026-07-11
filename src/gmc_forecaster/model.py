@@ -1,80 +1,226 @@
 """
-gmc_model.py — прозрачная модель прогноза спроса t+1.
+вариант B: двухшаговая модель «доля рынка → спрос».
 
-Модель: log(demand_next) = a + b·log(lag1) + c·d_price_rel
-                              + d·log(ad_product+1) + e·cum_major + f·minor_since
-Логика: b — авторегрессия (инерция/рост), c — эластичность по относительной цене,
-d — отдача рекламы, e/f — эффект новых разработок. Всё интерпретируемо и
-защищаемо на интервью. На малых данных линейная модель предпочтительнее бустинга.
+Стадия 1 (доля): агрегированный логит (MNL) через инверсию Берри.
+  Доли по ячейке суммируются < 100% -> есть «внешняя опция» s0 = 1 - Σ sᵢ.
+  Оценка обычным OLS:   ln(sᵢ / s0) = β·Xᵢ + FE(ячейка) + FE(группа) + ε
+  Прогноз:   Aᵢ = exp(β·Xᵢ);  sᵢ = Aᵢ / (1 + Σ Aⱼ).
+  Так корректно моделируется замещение: поднял свою цену -> доля утекает
+  к конкурентам и во внешнюю опцию. Это и есть движок «крутить цены».
 
-Интерфейс намеренно как у sklearn: fit(df) / predict(df).
+Стадия 2 (объём): implied-объём ячейки = own_sold / (own_share/100).
+  Прогноз спроса ≈ прогноз_доли × объём.
+
+Признаки берём по всем 8 компаниям из листа 'W'
+Групповые эффекты — фиксированные (дамми); с ростом числа групп -> random effects.
+
+Зависимости: pandas, numpy, scikit-learn.
 """
 
 from __future__ import annotations
-from typing import cast
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
+from .parser import SCHEMA as S, CH, _num, _stars
 
-MODEL_FEATURES = [
-    "log_lag1",
-    "d_price_rel",
-    "log_ad",
-    "cum_major",
-    "minor_since",
+__all__ = [
+    "load_panel",
+    "ShareModel",
+    "fit_seasonality",
+    "cell_volume",
+    "counterfactual",
+    "predict_demand",
+    "CH",
 ]
 
-
-def _design(df: pd.DataFrame) -> pd.DataFrame:
-    X = pd.DataFrame(index=df.index)
-    X["log_lag1"] = np.log(df["lag1"].clip(lower=1))
-    X["d_price_rel"] = df["d_price_rel"].fillna(0.0)
-    X["log_ad"] = np.log(df["ad_product"].fillna(0.0) + 1)
-    X["cum_major"] = df["cum_major"].fillna(0)
-    X["minor_since"] = df["minor_since"].fillna(0)
-    return X
+FEATURES = ["log_price", "log_adspend", "rating"]
 
 
-class DemandModel:
-    def __init__(self) -> None:
-        self.reg = LinearRegression()
+# ---------- извлечение панели 8 компаний ----------
+def load_panel(paths: list[str]) -> pd.DataFrame:
+    """Полная панель: (файл, группа, кв, компания, продукт, канал) -> price/share/adspend/rating."""
+    rows = []
+    for path in paths:
+        W = [
+            _num(v)
+            for v in pd.read_excel(path, sheet_name="W", header=None)
+            .iloc[:, 0]
+            .tolist()
+        ]
+        group = int(W[S["group"]]) if W[S["group"]] is not None else 0
+        year, q = int(W[S["year"]]), int(W[S["quarter"]])
+        for co in range(1, 9):
+            adspend = W[S["adspend_base"] + 7 * (co - 1)]
+            for p in (1, 2, 3):
+                rating = _stars(W[S["rating_base"] + 7 * (co - 1) + (p - 1)])
+                for ch, ci in CH.items():
+                    off = 3 * (p - 1) + ci
+                    rows.append(
+                        {
+                            "file": path,
+                            "group": group,
+                            "year": year,
+                            "quarter": q,
+                            "t": year * 4 + (q - 1),
+                            "company": co,
+                            "product": p,
+                            "channel": ch,
+                            "cell": f"{ch}{p}",
+                            "gq": f"{group}_{year}Q{q}",
+                            "price": W[S["price_base"] + 20 * (co - 1) + off],
+                            "share": W[S["share_base"] + 10 * (co - 1) + off],
+                            "adspend": adspend,
+                            "rating": rating,
+                        }
+                    )
+    df = pd.DataFrame(rows)
+    # внешняя опция: доля непокрытого рынка в ячейке (в процентах)
+    tot = df.groupby(["gq", "cell"])["share"].transform("sum")
+    df["share_out"] = 100.0 - tot
+    return df
 
-    def fit(self, df: pd.DataFrame) -> DemandModel:
-        X = _design(df)
-        y = np.log(df["demand_next"].clip(lower=1))
-        self.reg.fit(X, y)
-        self.coef_ = dict(zip(MODEL_FEATURES, self.reg.coef_))
-        self.intercept_ = self.reg.intercept_
+
+# ---------- Стадия 1: логит-модель доли ----------
+class ShareModel:
+    def _design(self, d: pd.DataFrame) -> pd.DataFrame:
+        X = pd.DataFrame(index=d.index)
+        X["log_price"] = np.log(d["price"].clip(lower=1))
+        X["log_adspend"] = np.log(d["adspend"].fillna(0).clip(lower=0) + 1)
+        X["rating"] = d["rating"].fillna(self._rating_mean)
+        for c in self._cellcols:
+            X[c] = (d["cell"] == c.replace("cell_", "")).astype(float)
+        for g in self._grpcols:
+            X[g] = (d["group"].astype(str) == g.replace("g_", "")).astype(
+                float
+            )
+        return X[self.cols]
+
+    def fit(self, df: pd.DataFrame) -> ShareModel:
+        d = df[(df["share"] > 0) & (df["share_out"] > 0)].copy()
+        self._rating_mean = d["rating"].mean()
+        # фиксированные эффекты (drop_first -> базовая категория в интерсепте)
+        self._cellcols = [f"cell_{c}" for c in sorted(d["cell"].unique())[1:]]
+        self._grpcols = [
+            f"g_{g}" for g in sorted(d["group"].astype(str).unique())[1:]
+        ]
+        self.cols = FEATURES + self._cellcols + self._grpcols
+        X = self._design(d)
+        y = np.log(d["share"] / 100) - np.log(
+            d["share_out"] / 100
+        )  # инверсия Берри
+        self.reg = LinearRegression().fit(X, y)
+        self.coef_ = dict(zip(self.cols, self.reg.coef_))
+        self.r2 = self.reg.score(X, y)
+        self.n = len(d)
         return self
 
-    def predict(self, df: pd.DataFrame) -> np.ndarray:
-        return np.exp(self.reg.predict(_design(df)))  # type: ignore[no-any-return]
+    def attraction(self, d: pd.DataFrame) -> np.ndarray:
+        """Aᵢ = exp(β·Xᵢ) относительно внешней опции."""
+        return np.exp(self.reg.predict(self._design(d)))  # type: ignore[no-any-return]
+
+    def predict_shares(self, cell_df: pd.DataFrame) -> np.ndarray:
+        """Доли (в %) для одной ячейки одной группы-квартала (набор компаний)."""
+        A = self.attraction(cell_df)
+        return 100.0 * A / (1.0 + A.sum())  # type: ignore[no-any-return]
+
+    def price_elasticity(self, share_pct: float) -> float:
+        """Собственная эластичность доли по цене в MNL: β_price·(1 − sᵢ)."""
+        coef = self.coef_["log_price"]
+        return float(coef) * (1 - share_pct / 100)
 
 
-def _mape(y: np.ndarray, p: np.ndarray) -> float:
-    y, p = np.asarray(y, float), np.asarray(p, float)
-    return float(np.mean(np.abs((y - p) / y)) * 100)
+# ---------- Стадия 2: объём рынка ----------
+def fit_seasonality(hst_paths: list[str]) -> dict[int, float]:
+    """
+    Сезонные факторы объёма рынка по history-файлам группы 0 (компании-клоны с
+    фикс. решениями -> вариация спроса = чистая сезонность). Оценка с отделением
+    тренда:  log(demand) ~ FE(ячейка) + t + dummies(квартал).
+    Возвращает {квартал: множитель}, нормированный к среднему геометрическому 1.
+    """
+    import math
+    from .parser import parse_report
+
+    d = pd.concat([parse_report(f)[1] for f in hst_paths], ignore_index=True)
+    d["cell"] = d["channel"] + d["product"].astype(str)
+    d["t"] = d["year"] * 4 + (d["quarter"] - 1)
+    d["t"] -= d["t"].min()
+    d = d[d["demand"] > 0].copy()
+    y = np.log(d["demand"])
+    cell = pd.get_dummies(d["cell"], drop_first=True).astype(float)
+    qd = pd.get_dummies(d["quarter"], prefix="q", drop_first=True).astype(
+        float
+    )
+    X = pd.concat(
+        [
+            d[["t"]].reset_index(drop=True),
+            cell.reset_index(drop=True),
+            qd.reset_index(drop=True),
+        ],
+        axis=1,
+    )
+    coef = dict(zip(X.columns, LinearRegression().fit(X, y).coef_))
+    gammas = {q: coef.get(f"q_{q}", 0.0) for q in (1, 2, 3, 4)}
+    gm = math.exp(sum(gammas.values()) / 4)
+    return {q: math.exp(gammas[q]) / gm for q in (1, 2, 3, 4)}
 
 
-def backtest(
-    df: pd.DataFrame, holdout_quarter: int
-) -> tuple[dict[str, object], pd.DataFrame]:
-    """Обучение на кварталах < holdout, прогноз на holdout. Сравнение с наивными."""
-    tr = df[df["quarter"] < holdout_quarter]
-    te = df[df["quarter"] == holdout_quarter]
-    m = DemandModel().fit(tr)
-    pred = m.predict(te)
-    y = cast(np.ndarray, te["demand_next"].values)
-    naive_persist = cast(np.ndarray, te["lag1"].values)  # спрос не меняется
-    g = float(
-        (tr["demand_next"] / tr["lag1"]).mean()
-    )  # средний рост на обучении
-    naive_growth = cast(np.ndarray, te["lag1"].values) * g
+def cell_volume(own_sold: float, own_share_pct: float) -> float | None:
+    """implied-объём ячейки из собственных продаж и доли."""
+    if own_share_pct and own_share_pct > 0:
+        return own_sold / (own_share_pct / 100)
+    return None
+
+
+def counterfactual(
+    model: ShareModel, cell_df: pd.DataFrame, company: int, price_mult: float
+) -> pd.DataFrame:
+    """Что будет с долями, если компания изменит свою цену в price_mult раз."""
+    base = model.predict_shares(cell_df)
+    cf = cell_df.copy()
+    cf["price"] = cf["price"].astype(float)
+    cf.loc[cf["company"] == company, "price"] *= price_mult
+    new = model.predict_shares(cf)
+    out = cell_df[["company", "price", "share"]].copy()
+    out["share_pred"] = base.round(2)
+    out["share_cf"] = new.round(2)
+    out["price_cf"] = cf["price"].values
+    return out
+
+
+def predict_demand(
+    model: ShareModel,
+    cell_df: pd.DataFrame,
+    company: int,
+    own_sold: float,
+    own_share_now_pct: float,
+    price_mult: float = 1.0,
+    seasonality: dict[int, float] | None = None,
+    quarter_now: int | None = None,
+    quarter_next: int | None = None,
+) -> dict[str, float | None]:
+    """
+    Прогноз собственного спроса в ячейке под сценарием.
+    Объём калибруем по текущим продажам/доле; если задана сезонность (из группы 0),
+    масштабируем объём на след. квартал множителем seas[next]/seas[now].
+    Спрос ≈ прогноз_доли × объём.
+    """
+    vol = cell_volume(own_sold, own_share_now_pct)
+    seas_ratio = 1.0
+    if seasonality and quarter_now and quarter_next:
+        seas_ratio = seasonality[quarter_next] / seasonality[quarter_now]
+    if vol is not None:
+        vol *= seas_ratio
+    cf = cell_df.copy()
+    cf["price"] = cf["price"].astype(float)
+    if price_mult != 1.0:
+        cf.loc[cf["company"] == company, "price"] *= price_mult
+    shares = model.predict_shares(cf)
+    own_share_pred = float(shares[cf["company"].values == company][0])
     return {
-        "n_train": len(tr),
-        "n_test": len(te),
-        "MAPE_model": round(_mape(y, pred), 1),
-        "MAPE_persist": round(_mape(y, naive_persist), 1),
-        "MAPE_growth": round(_mape(y, naive_growth), 1),
-        "coef": {k: round(v, 3) for k, v in m.coef_.items()},
-    }, te.assign(pred=pred.round(0), truth=y)
+        "own_share_pred_pct": round(own_share_pred, 2),
+        "seas_ratio": round(seas_ratio, 3),
+        "cell_volume": None if vol is None else round(vol, 0),
+        "demand_pred": None
+        if vol is None
+        else round(own_share_pred / 100 * vol, 0),
+    }

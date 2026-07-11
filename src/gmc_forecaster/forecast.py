@@ -21,8 +21,8 @@ forecast.py — прогноз спроса на следующий кварта
 
 from __future__ import annotations
 import pandas as pd
-from .parser_flat import parse_report_flat
-from .share_model import (
+from .parser import parse_report
+from .model import (
     load_panel,
     ShareModel,
     fit_seasonality,
@@ -72,7 +72,7 @@ def forecast(
     seas = fit_seasonality(history) if history else None
 
     cur_panel = load_panel([current])
-    meta, own = parse_report_flat(current)
+    meta, own = parse_report(current)
     company = meta["company"]
     q_now = meta["quarter"]
     q_next_raw = scenario.get("quarter_next", q_now % 4 + 1)

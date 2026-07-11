@@ -15,43 +15,19 @@ uv sync
 
 ## Запуск
 
-Утилита вызывается командой `gmc-forecaster` и имеет три подкоманды.
-Справка:
+Утилита вызывается командой `gmc-forecaster` и прогнозирует спрос под
+сценарием решений. Справка:
 
 ```bash
 uv run gmc-forecaster --help
-uv run gmc-forecaster <команда> --help
 ```
-
-### `parse` — разбор отчёта GMC
-
-Читает отчёт(ы) `.xls`/`.xlsx` (лист `W`) и печатает таблицу по каналам ×
-продуктам. Можно выгрузить в JSON/CSV, получить текстовый бриф или склеить
-несколько отчётов в таблицу переходов `X_t -> demand_next`:
-
-```bash
-# таблица в stdout
-uv run gmc-forecaster parse W115264.xls
-
-# выгрузка record в JSON / длинной таблицы в CSV
-uv run gmc-forecaster parse W115264.xls --json out.json
-uv run gmc-forecaster parse W115264.xls --csv  out.csv
-
-# человекочитаемый бриф одного квартала
-uv run gmc-forecaster parse W115264.xls --explain
-
-# склеить историю в обучающую таблицу переходов
-uv run gmc-forecaster parse data/*.xls --history hist.csv
-```
-
-### `forecast` — прогноз спроса под сценарием
 
 Основной рабочий интерфейс «крутить цены/рекламу»: считает спрос на
 следующий квартал по всем 9 ячейкам (3 продукта × 3 канала) под заданным
 сценарием решений.
 
 ```bash
-uv run gmc-forecaster forecast \
+uv run gmc-forecaster \
     --current  W115264.xls \
     --train    W1152*.xls W1312*.xls \
     --history  Hst*.xlsx \
@@ -74,17 +50,6 @@ uv run gmc-forecaster forecast \
   "adspend_mult": 1.15
 }
 ```
-
-### `backtest` — бэктест модели спроса
-
-Обучает прозрачную регрессию спроса на истории отчётов и сравнивает её с
-наивными базлайнами на отложенном квартале:
-
-```bash
-uv run gmc-forecaster backtest data/*.xls --holdout 3
-```
-
-`--holdout` — номер квартала для валидации (по умолчанию `3`).
 
 ## Разработка
 

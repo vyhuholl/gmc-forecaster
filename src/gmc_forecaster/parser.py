@@ -1,5 +1,5 @@
 """
-gmc_parser_flat.py — разбор отчёта GMC по ЕДИНСТВЕННОМУ последнему листу 'W'
+Разбор отчёта GMC по ЕДИНСТВЕННОМУ последнему листу 'W'
 (плоский числовой экспорт). Читает только 'W', не трогает именованные листы,
 поэтому полностью независим от языка содержимого и имён листов.
 
@@ -71,7 +71,7 @@ def _off(p: int, ch: str) -> int:
     return 3 * (p - 1) + CH[ch]
 
 
-def parse_report_flat(path: str) -> tuple[dict[str, Any], pd.DataFrame]:
+def parse_report(path: str) -> tuple[dict[str, Any], pd.DataFrame]:
     col = pd.read_excel(path, sheet_name="W", header=None).iloc[:, 0].tolist()
     W = [_num(v) for v in col]
     S = SCHEMA
