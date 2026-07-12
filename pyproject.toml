@@ -1,9 +1,9 @@
 [project]
 name = "gmc-forecaster"
 version = "0.1.0"
-description = "Двухшаговая модель доля-рынка/спрос для Global Management Challenge"
+description = "Двухшаговая модель доля-рынка/спрос по данным Global Management Challenge"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "openpyxl>=3.1.5",
     "pandas>=3.0.3",

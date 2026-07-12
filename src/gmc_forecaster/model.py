@@ -118,9 +118,15 @@ class ShareModel:
         """Aᵢ = exp(β·Xᵢ) относительно внешней опции."""
         return np.exp(self.reg.predict(self._design(d)))  # type: ignore[no-any-return]
 
-    def predict_shares(self, cell_df: pd.DataFrame) -> np.ndarray:
-        """Доли (в %) для одной ячейки одной группы-квартала (набор компаний)."""
+    def predict_shares(
+        self, cell_df: pd.DataFrame, attr_mult: np.ndarray | None = None
+    ) -> np.ndarray:
+        """Доли (в %) для одной ячейки одной группы-квартала (набор компаний).
+        attr_mult — поэлементный множитель привлекательности Aᵢ (напр. эффект
+        дистрибьюторов у своей компании); None -> без изменений."""
         A = self.attraction(cell_df)
+        if attr_mult is not None:
+            A = A * attr_mult
         return 100.0 * A / (1.0 + A.sum())  # type: ignore[no-any-return]
 
     def price_elasticity(self, share_pct: float) -> float:
