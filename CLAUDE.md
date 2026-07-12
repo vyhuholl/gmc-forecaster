@@ -59,9 +59,13 @@ uv run gmc-forecaster backtest \
   - `load_panel(paths)` → панель по всем 8 компаниям (price/share/adspend/rating),
     + внешняя опция `share_out = 100 − Σ`.
   - `ShareModel` — **стадия 1**: логит доли через инверсию Берри
-    `ln(sᵢ/s₀) = β·X + FE(ячейка) + FE(группа)`, OLS (`LinearRegression`).
-    Признаки `FEATURES = [log_price, log_adspend, rating]`. `predict_shares`
-    даёт MNL-замещение, `counterfactual` — что будет с долями при смене цены.
+    `ln(sᵢ/s₀) = β·X + FE(ячейка) + FE(группа) + FE(фирма)`, OLS
+    (`LinearRegression`). Признаки `FEATURES = [log_price, log_adspend, rating]`.
+    **Firm-эффект** (дамми company×group, центр. внутри группы) ловит устойчивую
+    фирменную гетерогенность → снижает регрессию-к-среднему в долях; это уровень,
+    не наклон → эластичность/`Δ_рычаг` почти не меняются. Незнакомая фирма
+    откатывается на групповой эффект. `predict_shares` даёт MNL-замещение,
+    `counterfactual` — что будет с долями при смене цены.
   - `fit_seasonality(hst)` → сезонные множители {Q:factor} по группе 0.
     `cell_volume` = own_sold/(own_share/100). **Стадия 2**: спрос ≈ доля × объём
     с сезонной поправкой.

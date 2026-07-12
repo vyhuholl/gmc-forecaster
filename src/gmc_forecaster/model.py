@@ -3,7 +3,12 @@
 
 Стадия 1 (доля): агрегированный логит (MNL) через инверсию Берри.
   Доли по ячейке суммируются < 100% -> есть «внешняя опция» s0 = 1 - Σ sᵢ.
-  Оценка обычным OLS:   ln(sᵢ / s0) = β·Xᵢ + FE(ячейка) + FE(группа) + ε
+  Оценка обычным OLS:   ln(sᵢ / s0) = β·Xᵢ + FE(ячейка) + FE(группа)
+                                      + FE(фирма, центр. внутри группы) + ε
+  Firm-эффект ловит устойчивую фирменную гетерогенность (бренд/дистрибуция),
+  которую цена/рейтинг не объясняют; это уровень, не наклон -> эласт. цены и
+  контрфактик «крутить цены» почти не меняются, улучшается уровень доли/спроса.
+  Центрирование внутри группы -> незнакомая фирма откатывается на групп. эффект.
   Прогноз:   Aᵢ = exp(β·Xᵢ);  sᵢ = Aᵢ / (1 + Σ Aⱼ).
   Так корректно моделируется замещение: поднял свою цену -> доля утекает
   к конкурентам и во внешнюю опцию. Это и есть движок «крутить цены».
@@ -83,6 +88,11 @@ def load_panel(paths: list[str]) -> pd.DataFrame:
 
 
 # ---------- Стадия 1: логит-модель доли ----------
+def _firm(d: pd.DataFrame) -> pd.Series:
+    """Идентификатор фирмы = группа_компания (напр. '11_5')."""
+    return d["group"].astype(str) + "_" + d["company"].astype(str)
+
+
 class ShareModel:
     def _design(self, d: pd.DataFrame) -> pd.DataFrame:
         X = pd.DataFrame(index=d.index)
@@ -95,6 +105,12 @@ class ShareModel:
             X[g] = (d["group"].astype(str) == g.replace("g_", "")).astype(
                 float
             )
+        # firm-эффекты, центрированные ВНУТРИ группы (эффект-кодирование):
+        # реф-фирма группы = −1 по всем её столбцам, прочие = 0/1. Незнакомая
+        # фирма -> все столбцы 0 -> откат на групповой эффект (см. fit).
+        firm = _firm(d)
+        for col, (f, ref) in self._firm_spec.items():
+            X[col] = np.where(firm == f, 1.0, np.where(firm == ref, -1.0, 0.0))
         return X[self.cols]
 
     def fit(self, df: pd.DataFrame) -> ShareModel:
@@ -105,7 +121,20 @@ class ShareModel:
         self._grpcols = [
             f"g_{g}" for g in sorted(d["group"].astype(str).unique())[1:]
         ]
-        self.cols = FEATURES + self._cellcols + self._grpcols
+        # firm-девиации от среднего своей группы (эффект-кодирование): реф-фирма
+        # каждой группы кодируется как −Σ остальных, поэтому незнакомая фирма
+        # даёт нулевую девиацию и наследует групповой уровень.
+        self._firm_spec: dict[str, tuple[str, str]] = {}
+        for _, sub in d.groupby(d["group"].astype(str)):
+            firms = sorted(_firm(sub).unique())
+            if len(firms) < 2:  # одна фирма -> девиация не определена
+                continue
+            ref = firms[-1]
+            for f in firms[:-1]:
+                self._firm_spec[f"firm_{f}"] = (f, ref)
+        self.cols = (
+            FEATURES + self._cellcols + self._grpcols + list(self._firm_spec)
+        )
         X = self._design(d)
         y = np.log(d["share"] / 100) - np.log(
             d["share_out"] / 100
