@@ -1,7 +1,0 @@
-{
-  "price": {"EAEU1": 300, "EAEU3": 820, "INT1": 320},
-  "adspend_mult": 1.15,
-  "dist_n": {"EAEU": 7, "ASEAN": 6},
-  "dist_comm": {"EAEU": 15},
-  "dist_elasticity": {"n": 0.15, "comm": 0.10}
-}
