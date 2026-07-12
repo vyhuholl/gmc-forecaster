@@ -154,11 +154,20 @@ class ShareModel:
     ) -> np.ndarray:
         """Доли (в %) для одной ячейки одной группы-квартала (набор компаний).
         attr_mult — поэлементный множитель привлекательности Aᵢ (напр. эффект
-        дистрибьюторов у своей компании); None -> без изменений."""
-        A = self.attraction(cell_df)
+        дистрибьюторов у своей компании); None -> без изменений.
+        Неактивные компании (цена ≤ 0 или пусто — не предлагают продукт)
+        исключаются из конкуренции и получают долю 0: иначе клип цены 0→1 дал бы
+        фантомно «дешёвого» игрока, забирающего почти всю долю ячейки."""
+        price = pd.to_numeric(cell_df["price"], errors="coerce").to_numpy()
+        active = np.isfinite(price) & (price > 0)
+        shares = np.zeros(len(cell_df))
+        if not active.any():
+            return shares
+        A = self.attraction(cell_df[active])
         if attr_mult is not None:
-            A = A * attr_mult
-        return 100.0 * A / (1.0 + A.sum())  # type: ignore[no-any-return]
+            A = A * np.asarray(attr_mult)[active]
+        shares[active] = 100.0 * A / (1.0 + A.sum())
+        return shares
 
     def price_elasticity(self, share_pct: float) -> float:
         """Собственная эластичность доли по цене в MNL: β_price·(1 − sᵢ)."""
