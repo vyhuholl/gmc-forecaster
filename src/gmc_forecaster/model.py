@@ -3,21 +3,25 @@
 
 Стадия 1 (доля): агрегированный логит (MNL) через инверсию Берри.
   Доли по ячейке суммируются < 100% -> есть «внешняя опция» s0 = 1 - Σ sᵢ.
-  Оценка обычным OLS:   ln(sᵢ / s0) = β·Xᵢ + FE(ячейка) + FE(группа)
-                                      + FE(фирма, центр. внутри группы) + ε
-  Firm-эффект ловит устойчивую фирменную гетерогенность (бренд/дистрибуция),
-  которую цена/рейтинг не объясняют; это уровень, не наклон -> эласт. цены и
-  контрфактик «крутить цены» почти не меняются, улучшается уровень доли/спроса.
-  Центрирование внутри группы -> незнакомая фирма откатывается на групп. эффект.
-  Прогноз:   Aᵢ = exp(β·Xᵢ);  sᵢ = Aᵢ / (1 + Σ Aⱼ).
-  Так корректно моделируется замещение: поднял свою цену -> доля утекает
-  к конкурентам и во внешнюю опцию. Это и есть движок «крутить цены».
+  Модель:  ln(sᵢ / s0) = β·Xᵢ + FE(ячейка) + FE(группа)
+                         + FE(фирма, центр. внутри группы)
+                         + (β_price + u_g)·log_price + ε
+  • Firm-эффект ловит устойчивую фирменную гетерогенность (бренд/дистрибуция),
+    которую цена/рейтинг не объясняют; это уровень, не наклон. Центрирование
+    внутри группы -> незнакомая фирма откатывается на групповой эффект.
+  • Random slope u_g: наклон цены гетерогенен по группам (эмпирически −2.5…−4.9).
+    u_g усаживаются к global штрафом (ridge), λ выбирается leave-one-quarter-out
+    CV -> хорошо наблюдаемая группа берёт свой наклон, разреженная/новая (мало
+    кварталов -> не идентифицируется) откатывается к global. Это partial pooling.
+  Оценка — штрафованный МНК (штраф только на u_g). Прогноз: Aᵢ = exp(β·Xᵢ);
+  sᵢ = Aᵢ / (1 + Σ Aⱼ). Так корректно моделируется замещение: поднял свою цену
+  -> доля утекает к конкурентам и во внешнюю опцию. Это движок «крутить цены».
 
 Стадия 2 (объём): implied-объём ячейки = own_sold / (own_share/100).
   Прогноз спроса ≈ прогноз_доли × объём.
 
-Признаки берём по всем 8 компаниям из листа 'W'
-Групповые эффекты — фиксированные (дамми); с ростом числа групп -> random effects.
+Признаки берём по всем 8 компаниям из листа 'W'. Групповые эффекты и наклоны —
+фикс. дамми + усадка (partial pooling); с ростом числа групп -> полноценные RE.
 
 Зависимости: pandas, numpy, scikit-learn.
 """
@@ -96,6 +100,7 @@ def _firm(d: pd.DataFrame) -> pd.Series:
 class ShareModel:
     def _design(self, d: pd.DataFrame) -> pd.DataFrame:
         X = pd.DataFrame(index=d.index)
+        X["const"] = 1.0
         X["log_price"] = np.log(d["price"].clip(lower=1))
         X["log_adspend"] = np.log(d["adspend"].fillna(0).clip(lower=0) + 1)
         X["rating"] = d["rating"].fillna(self._rating_mean)
@@ -111,12 +116,53 @@ class ShareModel:
         firm = _firm(d)
         for col, (f, ref) in self._firm_spec.items():
             X[col] = np.where(firm == f, 1.0, np.where(firm == ref, -1.0, 0.0))
+        # групповые ДЕВИАЦИИ наклона цены u_g (random slope): эффект. наклон
+        # группы g = global log_price + u_g. Незнакомая группа -> нули столбцов
+        # -> global (усадка задаётся штрафом на u_g, см. fit/_choose_ridge).
+        grp = d["group"].astype(str)
+        lp = X["log_price"]
+        for g in self._slope_groups:
+            X[f"lp_g_{g}"] = np.where(grp == g, lp, 0.0)
         return X[self.cols]
+
+    @staticmethod
+    def _solve(X: np.ndarray, y: np.ndarray, pen: np.ndarray) -> np.ndarray:
+        """Штрафованный МНК: min ||Xβ−y||² + Σ penⱼ·βⱼ² как расширенная задача
+        наименьших квадратов lstsq([X; diag(√pen)], [y; 0]). Штраф на u_g>0
+        снимает коллинеарность global-наклона с групповыми девиациями (усадка)."""
+        sq = np.sqrt(pen)
+        Xa = np.vstack([X, np.diag(sq)])
+        ya = np.concatenate([y, np.zeros(len(pen))])
+        sol: np.ndarray = np.linalg.lstsq(Xa, ya, rcond=None)[0]
+        return sol
+
+    def _choose_ridge(
+        self, X: np.ndarray, y: np.ndarray, base: np.ndarray, gq: np.ndarray
+    ) -> float:
+        """λ усадки групповых наклонов через leave-one-quarter-out CV по gq
+        (обобщается ли свой наклон группы на её невиданный квартал). Мало
+        групп/кварталов -> сильная усадка к global."""
+        units = np.unique(gq)
+        if len(self._slope_groups) < 2 or len(units) < 2:
+            return 1e6
+        grid = [0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0]
+        best_lam, best_err = grid[-1], float("inf")
+        for lam in grid:
+            pen = base * lam
+            err = 0.0
+            for u in units:
+                tr = gq != u
+                beta = self._solve(X[tr], y[tr], pen)
+                r = y[~tr] - X[~tr] @ beta
+                err += float(r @ r)
+            if err < best_err:
+                best_err, best_lam = err, lam
+        return best_lam
 
     def fit(self, df: pd.DataFrame) -> ShareModel:
         d = df[(df["share"] > 0) & (df["share_out"] > 0)].copy()
         self._rating_mean = d["rating"].mean()
-        # фиксированные эффекты (drop_first -> базовая категория в интерсепте)
+        # фиксированные эффекты (drop_first -> базовая категория в const)
         self._cellcols = [f"cell_{c}" for c in sorted(d["cell"].unique())[1:]]
         self._grpcols = [
             f"g_{g}" for g in sorted(d["group"].astype(str).unique())[1:]
@@ -132,22 +178,38 @@ class ShareModel:
             ref = firms[-1]
             for f in firms[:-1]:
                 self._firm_spec[f"firm_{f}"] = (f, ref)
+        # девиации наклона цены — по ВСЕМ группам (коллинеарность с global
+        # снимается штрафом при усадке)
+        self._slope_groups = sorted(d["group"].astype(str).unique())
         self.cols = (
-            FEATURES + self._cellcols + self._grpcols + list(self._firm_spec)
+            ["const"]
+            + FEATURES
+            + self._cellcols
+            + self._grpcols
+            + list(self._firm_spec)
+            + [f"lp_g_{g}" for g in self._slope_groups]
         )
-        X = self._design(d)
-        y = np.log(d["share"] / 100) - np.log(
-            d["share_out"] / 100
+        X = self._design(d).to_numpy(dtype=float)
+        y = (np.log(d["share"] / 100) - np.log(d["share_out"] / 100)).to_numpy(
+            dtype=float
         )  # инверсия Берри
-        self.reg = LinearRegression().fit(X, y)
-        self.coef_ = dict(zip(self.cols, self.reg.coef_))
-        self.r2 = self.reg.score(X, y)
+        # штраф только на девиации наклона u_g (усадка random slope)
+        base = np.array(
+            [1.0 if c.startswith("lp_g_") else 0.0 for c in self.cols]
+        )
+        self.ridge_ = self._choose_ridge(X, y, base, d["gq"].to_numpy())
+        self.beta = self._solve(X, y, base * self.ridge_)
+        self.coef_ = dict(zip(self.cols, self.beta))
+        resid = y - X @ self.beta
+        tss = float(((y - y.mean()) ** 2).sum())
+        self.r2 = 1.0 - float(resid @ resid) / tss if tss > 0 else 0.0
         self.n = len(d)
         return self
 
     def attraction(self, d: pd.DataFrame) -> np.ndarray:
         """Aᵢ = exp(β·Xᵢ) относительно внешней опции."""
-        return np.exp(self.reg.predict(self._design(d)))  # type: ignore[no-any-return]
+        X = self._design(d).to_numpy(dtype=float)
+        return np.exp(X @ self.beta)  # type: ignore[no-any-return]
 
     def predict_shares(
         self, cell_df: pd.DataFrame, attr_mult: np.ndarray | None = None
@@ -169,9 +231,15 @@ class ShareModel:
         shares[active] = 100.0 * A / (1.0 + A.sum())
         return shares
 
-    def price_elasticity(self, share_pct: float) -> float:
-        """Собственная эластичность доли по цене в MNL: β_price·(1 − sᵢ)."""
+    def price_elasticity(
+        self, share_pct: float, group: str | int | None = None
+    ) -> float:
+        """Собственная эластичность доли по цене в MNL: β_price·(1 − sᵢ).
+        Наклон группы = global log_price + u_g (если группа известна), иначе
+        global."""
         coef = self.coef_["log_price"]
+        if group is not None:
+            coef += self.coef_.get(f"lp_g_{group}", 0.0)
         return float(coef) * (1 - share_pct / 100)
 
 
