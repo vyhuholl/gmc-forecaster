@@ -43,7 +43,9 @@ def load_panel(paths: list[str]) -> pd.DataFrame:
     for path in paths:
         W = [
             _num(v)
-            for v in pd.read_excel(path, sheet_name="W", header=None)
+            for v in pd.read_excel(
+                path, sheet_name="W", header=None, engine="calamine"
+            )
             .iloc[:, 0]
             .tolist()
         ]

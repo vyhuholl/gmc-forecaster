@@ -18,14 +18,21 @@ make validate           # ruff format + ruff check + mypy --strict
 uv run gmc-forecaster --help
 ```
 
-Рабочий сценарий «крутить цены/рекламу»:
+Две подкоманды: `forecast` (прогноз под сценарием) и `backtest` (оценка на
+истории).
 
 ```bash
-uv run gmc-forecaster \
+# «крутить цены/рекламу»
+uv run gmc-forecaster forecast \
   --current  data/W115264.xls \
   --train    data/W1152*.xls data/W1312*.xls \
   --history  data/Hst*.xlsx \
   --scenario scenario.json --out forecast.csv
+
+# оценка качества модели по смежным парам кварталов
+uv run gmc-forecaster backtest \
+  --reports data/W1152*.xls data/W1312*.xls \
+  --history data/Hst*.xlsx --out backtest.csv
 ```
 
 `scenario.json`: `{"price": {"EAEU1": 300, ...}, "adspend_mult": 1.15,
@@ -45,7 +52,9 @@ uv run gmc-forecaster \
 - **parser.py** — `parse_report(path)` → `(meta, df по 9 ячейкам)`. Читает
   **только лист `W`** (плоский числовой экспорт) по позиционной схеме `SCHEMA`
   (0-based индексы, `off = 3*(product-1) + ch`). Не зависит от языка и версии
-  отчёта. `_num`/`_stars` — нормализация ячеек/рейтинга-звёзд.
+  отчёта. `_num`/`_stars` — нормализация ячеек/рейтинга-звёзд. Движок чтения —
+  `engine="calamine"` (читает и старый BIFF `.xls`, и strict-OOXML `.xlsx`
+  истории, где openpyxl не видит листов; тот же движок в `load_panel`).
 - **model.py** — ядро:
   - `load_panel(paths)` → панель по всем 8 компаниям (price/share/adspend/rating),
     + внешняя опция `share_out = 100 − Σ`.
@@ -59,7 +68,15 @@ uv run gmc-forecaster \
 - **forecast.py** — `forecast(current, train, history, scenario)`: собирает
   пайплайн, применяет сценарий к своей компании, возвращает df (спрос текущий/
   база/сценарий, доля, Δ_рычаг) + `df.attrs["meta"]`.
-- **cli.py** — точка входа `gmc-forecaster` (entry point в pyproject).
+- **backtest.py** — `backtest(reports, train, history)`: прогон по смежным
+  парам кварталов (Q_t→Q_{t+1}) внутри серии (группа+компания), сравнение с
+  фактом. Раскладывает ошибку на стадию 1 (доля, MAE) и стадию 2 (объём, MAPE),
+  сквозной спрос (MAPE) против бейзлайнов (персистенция, сезонный наив), в двух
+  режимах: **realistic** (конкуренты заморожены на Q_t) и **oracle** (факт
+  рынка Q_{t+1} целиком). Сценарий не нужен: решения берутся из отчёта Q_{t+1}
+  напрямую. Возвращает `(сводка, детализация по ячейкам)`.
+- **cli.py** — точка входа `gmc-forecaster` с подкомандами `forecast` и
+  `backtest` (entry point в pyproject).
 
 ## Данные (`data/`)
 
@@ -76,6 +93,8 @@ uv run gmc-forecaster \
   это модули пакета выше + CLI `gmc-forecaster`.
 - `scenario.json` **не** принимает `quarter_next` (убрано; квартал — из `--current`).
 - В коде остался **только** плоский парсер листа `W`; именованного парсера нет.
+- Ридер — единый `engine="calamine"`, а не автовыбор xlrd/openpyxl (§13): история
+  сохранена в strict-OOXML, openpyxl её не читает (пустой список листов).
 
 ## Конвенции
 

@@ -72,7 +72,13 @@ def _off(p: int, ch: str) -> int:
 
 
 def parse_report(path: str) -> tuple[dict[str, Any], pd.DataFrame]:
-    col = pd.read_excel(path, sheet_name="W", header=None).iloc[:, 0].tolist()
+    # engine='calamine' читает и старый BIFF .xls, и strict-OOXML .xlsx
+    # (историю), где openpyxl не видит листов
+    col = (
+        pd.read_excel(path, sheet_name="W", header=None, engine="calamine")
+        .iloc[:, 0]
+        .tolist()
+    )
     W = [_num(v) for v in col]
     S = SCHEMA
 
