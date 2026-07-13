@@ -6,21 +6,25 @@ cli.py — точка входа `gmc-forecaster`. Подкоманды:
 
 from __future__ import annotations
 import argparse
-import json
 import os
 import sys
 from typing import Any
 import pandas as pd
-from .forecast import forecast
+from .forecast import forecast, DIST_K_N, DIST_K_COMM
 from .backtest import backtest
 
 
 def _add_forecast(sub: argparse._SubParsersAction[Any]) -> None:
     fc = sub.add_parser(
-        "forecast", help="прогноз спроса под сценарием решений"
+        "forecast",
+        help="прогноз спроса; решения — с листа 'Your decisions' файла "
+        "--current",
     )
     fc.add_argument(
-        "--current", required=True, help="текущий отчёт (.xls/.xlsx)"
+        "--current",
+        required=True,
+        help="текущий отчёт (.xls/.xlsx); решения читаются с его первого "
+        "листа 'Your decisions'",
     )
     fc.add_argument(
         "--train",
@@ -34,7 +38,18 @@ def _add_forecast(sub: argparse._SubParsersAction[Any]) -> None:
         default=[],
         help="файлы группы 0 для сезонности",
     )
-    fc.add_argument("--scenario", required=True, help="scenario.json")
+    fc.add_argument(
+        "--dist-k-n",
+        type=float,
+        default=DIST_K_N,
+        help=f"коэф. эффекта числа дистрибьюторов (дефолт {DIST_K_N})",
+    )
+    fc.add_argument(
+        "--dist-k-comm",
+        type=float,
+        default=DIST_K_COMM,
+        help=f"коэф. эффекта комиссии дистрибьюторов (дефолт {DIST_K_COMM})",
+    )
     fc.add_argument("--out", help="сохранить прогноз в CSV")
     fc.add_argument(
         "--coeffs",
@@ -133,8 +148,9 @@ def _print_coeffs(df: pd.DataFrame, level: str) -> None:
 
 
 def _cmd_forecast(a: argparse.Namespace) -> None:
-    scenario = json.load(open(a.scenario, encoding="utf-8"))
-    df = forecast(a.current, a.train, a.history, scenario)
+    df = forecast(
+        a.current, a.train, a.history, k_n=a.dist_k_n, k_comm=a.dist_k_comm
+    )
     m = df.attrs["meta"]
     print(
         f"Компания {m['company']}, группа {m['group']}: "

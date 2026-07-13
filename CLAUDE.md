@@ -18,16 +18,15 @@ make validate           # ruff format + ruff check + mypy --strict
 uv run gmc-forecaster --help
 ```
 
-Две подкоманды: `forecast` (прогноз под сценарием) и `backtest` (оценка на
-истории).
+Две подкоманды: `forecast` (прогноз под решениями игрока) и `backtest` (оценка
+на истории).
 
 ```bash
-# «крутить цены/рекламу»
+# «крутить цены/рекламу»: правишь решения на листе 'Your decisions' в --current
 uv run gmc-forecaster forecast \
   --current  data/W115264.xls \
   --train    data/W1152*.xls data/W1312*.xls \
-  --history  data/Hst*.xlsx \
-  --scenario scenario.json --out forecast.csv
+  --history  data/Hst*.xlsx --out forecast.csv
 
 # оценка качества модели по смежным парам кварталов
 uv run gmc-forecaster backtest \
@@ -35,15 +34,16 @@ uv run gmc-forecaster backtest \
   --history data/Hst*.xlsx --out backtest.csv
 ```
 
-`scenario.json`: `{"price": {"EAEU1": 300, ...}, "adspend_mult": 1.15,
-"dist_n": {"EAEU": 7, ...}, "dist_comm": {"EAEU": 15, ...},
-"dist_elasticity": {"n": 0.15, "comm": 0.10}}` — частичные абс. цены по ячейкам
-+ опц. множитель рекламы + опц. **пер-канальные** число/комиссия дистрибьюторов
-(EAEU/ASEAN/INT; действуют на все 3 продукта канала). Дистрибьюторы наблюдаемы
-только у своей компании → дают множитель собственной привлекательности `A_own`
-в логите доли; сила эффекта задаётся коэффициентами `dist_elasticity` (дефолт
-`n`=0.15, `comm`=0.10). Незаданное берётся из `--current`. Квартал прогноза =
-следующий за кварталом в `--current`.
+Решения (цены по 9 ячейкам, реклама, **пер-канальные** число/комиссия
+дистрибьюторов EAEU/ASEAN/INT) читаются **прямо с первого листа
+`'Your decisions'`** файла `--current` (`parser.parse_decisions`, позиционная
+схема `DEC_SCHEMA`, языконезависимо) — **json-сценарий убран**. Рабочий процесс:
+правишь свои what-if решения в этом листе Excel → `forecast`. Реклама сворачивается
+в множитель бюджета компании-уровня; дистрибьюторы действуют на все 3 продукта
+канала, наблюдаемы только у своей компании → дают множитель собственной
+привлекательности `A_own` в логите доли. Сила эффекта дистрибьюторов — коэф.
+`k_n`/`k_comm` (дефолт 0.15/0.10, опц. оверрайд флагами `--dist-k-n`/`--dist-k-comm`).
+Квартал прогноза = следующий за кварталом в `--current`.
 Колонка **Δ_рычаг_%** изолирует эффект решения (сезонность есть и в базе,
 и в сценарии → сокращается).
 После таблицы прогноза `forecast` печатает **коэффициенты модели доли** со
@@ -60,6 +60,11 @@ uv run gmc-forecaster backtest \
   отчёта. `_num`/`_stars` — нормализация ячеек/рейтинга-звёзд. Движок чтения —
   `engine="calamine"` (читает и старый BIFF `.xls`, и strict-OOXML `.xlsx`
   истории, где openpyxl не видит листов; тот же движок в `load_panel`).
+  `parse_decisions(path)` → dict решений игрока с **первого листа
+  `'Your decisions'`** (позиционная схема `DEC_SCHEMA`, тоже языконезависимо):
+  `price{ячейка}`, `adspend_total` (тыс.ерз), `dist_n{канал}`, `dist_comm{канал}`;
+  пустая ячейка опускается (наследует текущее из `W`). Заменяет старый
+  `scenario.json`.
 - **model.py** — ядро:
   - `load_panel(paths)` → панель по всем 8 компаниям (price/share/adspend/rating),
     + внешняя опция `share_out = 100 − Σ`.
@@ -86,10 +91,12 @@ uv run gmc-forecaster backtest \
   - `fit_seasonality(hst)` → сезонные множители {Q:factor} по группе 0.
     `cell_volume` = own_sold/(own_share/100). **Стадия 2**: спрос ≈ доля × объём
     с сезонной поправкой.
-- **forecast.py** — `forecast(current, train, history, scenario)`: собирает
-  пайплайн, применяет сценарий к своей компании, возвращает df (спрос текущий/
-  база/сценарий, доля, Δ_рычаг) + `df.attrs["meta"]`, `df.attrs["coef_summary"]`
-  (коэф. со значимостью) и `df.attrs["fit"]` (R²/n/edf/λ).
+- **forecast.py** — `forecast(current, train, history, k_n?, k_comm?)`: собирает
+  пайплайн, читает решения игрока из `parse_decisions(current)` (лист
+  `'Your decisions'`) и применяет их к своей компании, возвращает df (спрос
+  текущий/база/сценарий, доля, Δ_рычаг) + `df.attrs["meta"]`,
+  `df.attrs["coef_summary"]` (коэф. со значимостью) и `df.attrs["fit"]`
+  (R²/n/edf/λ). `k_n`/`k_comm` — сила эффекта дистрибьюторов (дефолты).
 - **backtest.py** — `backtest(reports, train, history)`: прогон по смежным
   парам кварталов (Q_t→Q_{t+1}) внутри серии (группа+компания), сравнение с
   фактом. Раскладывает ошибку на стадию 1 (доля, MAE) и стадию 2 (объём, MAPE),
@@ -119,8 +126,10 @@ uv run gmc-forecaster backtest \
 
 - Имена `gmc_parser_flat.py` / `gmc_share_model.py` / `gmc_predict.py` устарели —
   это модули пакета выше + CLI `gmc-forecaster`.
-- `scenario.json` **не** принимает `quarter_next` (убрано; квартал — из `--current`).
-- В коде остался **только** плоский парсер листа `W`; именованного парсера нет.
+- `scenario.json` **убран** целиком: решения читаются с листа `'Your decisions'`
+  файла `--current` (`parse_decisions`); квартал — из `--current`.
+- В коде остались парсеры листа `W` (`parse_report`) и первого листа решений
+  (`parse_decisions`); обоих ведёт позиционная схема, именованного парсера нет.
 - Ридер — единый `engine="calamine"`, а не автовыбор xlrd/openpyxl (§13): история
   сохранена в strict-OOXML, openpyxl её не читает (пустой список листов).
 

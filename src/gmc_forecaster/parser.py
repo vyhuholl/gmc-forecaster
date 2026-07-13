@@ -49,6 +49,17 @@ SCHEMA = {
     "price_co_stride": 20,
 }
 
+# --- позиционная схема ПЕРВОГО листа 'Your decisions' (0-based row, col) ---
+# Выведена и провалидирована по 4 текущим отчётам (разные группы/компании);
+# как и SCHEMA листа 'W', позиции стабильны и не зависят от языка формы.
+# Строки рекламы/дистрибьюторов и цен — по каналам; столбцы — по продуктам.
+DEC_AD_ROW = {"EAEU": 13, "ASEAN": 14, "INT": 15}  # реклама + дистрибьюторы
+DEC_PRICE_ROW = {"EAEU": 18, "ASEAN": 19, "INT": 20}
+DEC_PROD_COL = {1: 5, 2: 7, 3: 9}  # столбцы продуктов 1/2/3
+DEC_IMAGE_COL = 4  # имидж-реклама канала
+DEC_DIST_N_COL = 15  # число агентов/дистрибьюторов канала
+DEC_DIST_COMM_COL = 22  # комиссия дистрибьюторов, %
+
 
 def _num(x: Any) -> Any:
     """нормализация ячейки 'W': число / текст / пусто(None)."""
@@ -69,6 +80,62 @@ def _stars(x: Any) -> int | None:
 
 def _off(p: int, ch: str) -> int:
     return 3 * (p - 1) + CH[ch]
+
+
+def _decnum(x: Any) -> float | None:
+    """числовое значение ячейки листа решений или None (пусто/текст)."""
+    v = _num(x)
+    return float(v) if isinstance(v, (int, float)) else None
+
+
+def parse_decisions(path: str) -> dict[str, Any]:
+    """Решения игрока с ПЕРВОГО листа ('Your decisions') отчёта по позиционной
+    схеме DEC_SCHEMA (языконезависимо). Это заменяет scenario.json: игрок правит
+    свои what-if цены/рекламу/дистрибьюторов прямо в Excel. Возвращает dict:
+      price{ячейка}            — абс. цены (ерз) по 9 ячейкам,
+      adspend_total            — суммарный бюджет рекламы (тыс. ерз): имидж по
+                                 3 каналам + товарная по 9 ячейкам (= уровень
+                                 компании модели W[adspend_base]/1000),
+      dist_n{канал}            — число дистрибьюторов,
+      dist_comm{канал}         — комиссия дистрибьюторов, %.
+    Пустая ячейка -> ключ опускается (наследует текущее из --current)."""
+    df = pd.read_excel(path, sheet_name=0, header=None, engine="calamine")
+
+    def at(r: int, c: int) -> float | None:
+        try:
+            return _decnum(df.iat[r, c])
+        except IndexError:
+            return None
+
+    price: dict[str, float] = {}
+    dist_n: dict[str, float] = {}
+    dist_comm: dict[str, float] = {}
+    ad_total = 0.0
+    for ch in CHANNELS:
+        for p in PRODUCTS:
+            v = at(DEC_PRICE_ROW[ch], DEC_PROD_COL[p])
+            if v is not None:
+                price[f"{ch}{p}"] = v
+        ar = DEC_AD_ROW[ch]
+        img = at(ar, DEC_IMAGE_COL)
+        if img is not None:
+            ad_total += img
+        for p in PRODUCTS:
+            v = at(ar, DEC_PROD_COL[p])
+            if v is not None:
+                ad_total += v
+        n = at(ar, DEC_DIST_N_COL)
+        if n is not None:
+            dist_n[ch] = n
+        comm = at(ar, DEC_DIST_COMM_COL)
+        if comm is not None:
+            dist_comm[ch] = comm
+    return {
+        "price": price,
+        "adspend_total": ad_total,
+        "dist_n": dist_n,
+        "dist_comm": dist_comm,
+    }
 
 
 def parse_report(path: str) -> tuple[dict[str, Any], pd.DataFrame]:

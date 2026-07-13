@@ -1,36 +1,33 @@
 """
-forecast.py — прогноз спроса на следующий квартал под сценарием решений.
-Это рабочий интерфейс «крутить цены/рекламу»: меняешь свои цены -> видишь спрос
-по всем 9 ячейкам (3 продукта × 3 канала).
+forecast.py — прогноз спроса на следующий квартал под решениями игрока.
+Это рабочий интерфейс «крутить цены/рекламу»: меняешь свои решения на ПЕРВОМ
+листе ('Your decisions') отчёта --current -> видишь спрос по всем 9 ячейкам
+(3 продукта × 3 канала).
 
 Пайплайн:
   1. Обучаем логит-модель доли на конкурентных отчётах (train).
   2. Оцениваем сезонность объёма по группе 0 (history, опционально).
   3. Берём текущее состояние рынка из current (все 8 компаний + свои продажи/доля).
-  4. Применяем сценарий (новые цены / множитель рекламы) к своей компании.
-  5. По каждой ячейке: доля(сценарий) × объём(с сезонной поправкой) = спрос.
+  4. Читаем решения игрока с листа 'Your decisions' файла --current
+     (parse_decisions) и применяем их к своей компании.
+  5. По каждой ячейке: доля(решения) × объём(с сезонной поправкой) = спрос.
 
-Формат scenario.json:
-  {
-    "price":   {"EAEU1": 320, "EAEU2": 580, "INT3": 740},   // абс. цены, частично
-    "adspend_mult": 1.15,                                    // опц. множитель рекламы
-    "dist_n":    {"EAEU": 7, "ASEAN": 6},                    // опц. число дистрибьюторов по каналам
-    "dist_comm": {"EAEU": 15},                               // опц. комиссия (%) по каналам
-    "dist_elasticity": {"n": 0.15, "comm": 0.10}             // опц. коэффициенты эффекта
-  }
-Незаданные ячейки/каналы сохраняют текущие значения. Дистрибьюторы —
-пер-канальные рычаги (EAEU/ASEAN/INT, действуют на все 3 продукта канала),
-наблюдаемы только у своей компании -> дают множитель СОБСТВЕННОЙ
-привлекательности A_own в логите доли (конкуренты не затронуты). Квартал
-прогноза берётся из текущего excel-файла (следующий за кварталом на листе 'W'),
-не из сценария.
+Решения (цены/реклама/дистрибьюторы) больше НЕ подаются в json — они читаются
+прямо из первого листа --current (см. parser.parse_decisions). База сравнения
+(спрос_база, Δ_рычаг) — исходные решения квартала с листа 'W'; правишь форму
+решений -> Δ_рычаг показывает эффект. Дистрибьюторы — пер-канальные рычаги
+(EAEU/ASEAN/INT, действуют на все 3 продукта канала), наблюдаемы только у своей
+компании -> дают множитель СОБСТВЕННОЙ привлекательности A_own в логите доли
+(конкуренты не затронуты). Сила эффекта — коэффициенты k_n/k_comm (дефолты
+DIST_K_N/DIST_K_COMM, опц. оверрайд из CLI). Квартал прогноза берётся из
+текущего excel-файла (следующий за кварталом на листе 'W').
 """
 
 from __future__ import annotations
 import math
 import numpy as np
 import pandas as pd
-from .parser import parse_report
+from .parser import parse_report, parse_decisions
 from .model import (
     load_panel,
     ShareModel,
@@ -38,8 +35,6 @@ from .model import (
     cell_volume,
     CH,
 )
-
-type Scenario = dict[str, int | float | dict[str, float]]
 
 RU = {"EAEU": "ЕАЭС", "ASEAN": "АСЕАН", "INT": "Интернет"}
 
@@ -104,7 +99,11 @@ def _predict_cell(
 
 
 def forecast(
-    current: str, train: list[str], history: list[str], scenario: Scenario
+    current: str,
+    train: list[str],
+    history: list[str],
+    k_n: float = DIST_K_N,
+    k_comm: float = DIST_K_COMM,
 ) -> pd.DataFrame:
     model = ShareModel().fit(load_panel(train))
     seas = fit_seasonality(history) if history else None
@@ -115,28 +114,22 @@ def forecast(
     q_now = meta["quarter"]  # из текущего excel-файла (лист 'W')
     q_next = q_now % 4 + 1  # квартал прогноза — следующий за текущим
     seas_ratio = (seas[q_next] / seas[q_now]) if seas else 1.0
-    price_sc_raw = scenario.get("price", {})
-    price_sc: dict[str, float] = (
-        price_sc_raw if isinstance(price_sc_raw, dict) else {}
+
+    # решения игрока с первого листа 'Your decisions' файла --current
+    dec = parse_decisions(current)
+    price_sc: dict[str, float] = dec["price"]
+    dist_n_sc: dict[str, float] = dec["dist_n"]
+    dist_comm_sc: dict[str, float] = dec["dist_comm"]
+    # реклама компании-уровня -> множитель относительно исходного бюджета из
+    # панели (W[adspend_base] в ерз; adspend_total на листе — в тыс. ерз)
+    orig_ad_ser = cur_panel.loc[cur_panel["company"] == company, "adspend"]
+    orig_ad = (
+        float(orig_ad_ser.iloc[0])
+        if len(orig_ad_ser) and pd.notna(orig_ad_ser.iloc[0])
+        else None
     )
-    ad_mult_raw = scenario.get("adspend_mult", 1.0)
-    ad_mult = (
-        float(ad_mult_raw) if isinstance(ad_mult_raw, (int, float)) else 1.0
-    )
-    dist_n_raw = scenario.get("dist_n", {})
-    dist_n_sc: dict[str, float] = (
-        dist_n_raw if isinstance(dist_n_raw, dict) else {}
-    )
-    dist_comm_raw = scenario.get("dist_comm", {})
-    dist_comm_sc: dict[str, float] = (
-        dist_comm_raw if isinstance(dist_comm_raw, dict) else {}
-    )
-    dist_el_raw = scenario.get("dist_elasticity", {})
-    dist_el: dict[str, float] = (
-        dist_el_raw if isinstance(dist_el_raw, dict) else {}
-    )
-    k_n = float(dist_el.get("n", DIST_K_N))
-    k_comm = float(dist_el.get("comm", DIST_K_COMM))
+    ad_total = float(dec["adspend_total"])
+    ad_mult = ad_total * 1000.0 / orig_ad if orig_ad and orig_ad > 0 else 1.0
 
     out = []
     for ch in CH:
