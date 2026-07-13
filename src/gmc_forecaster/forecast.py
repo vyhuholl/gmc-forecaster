@@ -230,4 +230,12 @@ def forecast(
         q_next=q_next,
         seas_ratio=round(seas_ratio, 3),
     )
+    # диагностика стадии 1: коэффициенты доли + значимость и качество подгонки
+    df.attrs["coef_summary"] = model.coef_summary()
+    df.attrs["fit"] = dict(
+        r2=round(model.r2, 3),
+        n=model.n,
+        edf=round(model.edf_, 1),
+        ridge=model.ridge_,
+    )
     return df

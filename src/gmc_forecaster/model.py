@@ -27,6 +27,7 @@
 """
 
 from __future__ import annotations
+import math
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
@@ -95,6 +96,41 @@ def load_panel(paths: list[str]) -> pd.DataFrame:
 def _firm(d: pd.DataFrame) -> pd.Series:
     """Идентификатор фирмы = группа_компания (напр. '11_5')."""
     return d["group"].astype(str) + "_" + d["company"].astype(str)
+
+
+# человекочитаемые метки/блоки коэффициентов (для coef_summary и вывода)
+_COEF_LABELS = {
+    "const": "Константа",
+    "log_price": "log(цена)",
+    "log_adspend": "log(реклама+1)",
+    "rating": "рейтинг (звёзды)",
+}
+_COEF_PREFIX = {
+    "cell_": ("ячейка ", "ячейка"),
+    "g_": ("группа ", "группа"),
+    "firm_": ("фирма ", "фирма"),
+    "lp_g_": ("наклон Δ группы ", "наклон"),
+}
+
+
+def _coef_label(col: str) -> str:
+    if col in _COEF_LABELS:
+        return _COEF_LABELS[col]
+    for pre, (lbl, _) in _COEF_PREFIX.items():
+        if col.startswith(pre):
+            return lbl + col[len(pre) :]
+    return col
+
+
+def _coef_block(col: str) -> str:
+    if col == "const":
+        return "const"
+    if col in FEATURES:
+        return "признак"
+    for pre, (_, blk) in _COEF_PREFIX.items():
+        if col.startswith(pre):
+            return blk
+    return "прочее"
 
 
 class ShareModel:
@@ -198,13 +234,57 @@ class ShareModel:
             [1.0 if c.startswith("lp_g_") else 0.0 for c in self.cols]
         )
         self.ridge_ = self._choose_ridge(X, y, base, d["gq"].to_numpy())
-        self.beta = self._solve(X, y, base * self.ridge_)
+        pen = base * self.ridge_
+        self.beta = self._solve(X, y, pen)
         self.coef_ = dict(zip(self.cols, self.beta))
         resid = y - X @ self.beta
         tss = float(((y - y.mean()) ** 2).sum())
         self.r2 = 1.0 - float(resid @ resid) / tss if tss > 0 else 0.0
         self.n = len(d)
+        self._infer(X, resid, pen)
         return self
+
+    def _infer(
+        self, X: np.ndarray, resid: np.ndarray, pen: np.ndarray
+    ) -> None:
+        """Стандартные ошибки/значимость коэффициентов.
+        Ковариация штрафованного МНК (сэндвич): Cov = σ²·Ainv·(XᵀX)·Ainv,
+        Ainv = (XᵀX + diag(pen))⁻¹ — та же матрица штрафа, что и в оценке. Для
+        непенализуемых признаков (цена/реклама/рейтинг/FE) сводится к обычной
+        OLS-ковариации σ²·(XᵀX)⁻¹; для наклонов u_g учитывает усадку. σ² берём
+        на эффективном числе ст. свободы n − edf, edf = tr(Ainv·XᵀX) («шляпа»
+        гребневой регрессии). p-value — двусторонний, нормальное приближение
+        (erfc); для штрафуемых u_g значимость приблизительная."""
+        XtX = X.T @ X
+        Ainv = np.linalg.pinv(XtX + np.diag(pen))
+        S1 = Ainv @ XtX
+        self.edf_ = float(np.trace(S1))
+        dof = max(self.n - self.edf_, 1.0)
+        sigma2 = float(resid @ resid) / dof
+        var = np.clip(np.diag(sigma2 * (S1 @ Ainv)), 0.0, None)
+        se = np.sqrt(var)
+        tstat = np.divide(self.beta, se, out=np.zeros_like(se), where=se > 0)
+        pval = np.array([math.erfc(abs(t) / math.sqrt(2)) for t in tstat])
+        self.se_ = dict(zip(self.cols, se))
+        self.tstat_ = dict(zip(self.cols, tstat))
+        self.pval_ = dict(zip(self.cols, pval))
+
+    def coef_summary(self) -> pd.DataFrame:
+        """Таблица коэффициентов стадии 1 со ст. ошибками и значимостью:
+        столбцы col/блок/признак/коэф/ст.ош/t/p. Блок группирует признаки
+        (const/признак/наклон/ячейка/группа/фирма) для читаемого вывода."""
+        return pd.DataFrame(
+            {
+                "col": c,
+                "блок": _coef_block(c),
+                "признак": _coef_label(c),
+                "коэф": float(self.coef_[c]),
+                "ст.ош": float(self.se_[c]),
+                "t": float(self.tstat_[c]),
+                "p": float(self.pval_[c]),
+            }
+            for c in self.cols
+        )
 
     def attraction(self, d: pd.DataFrame) -> np.ndarray:
         """Aᵢ = exp(β·Xᵢ) относительно внешней опции."""
@@ -251,7 +331,6 @@ def fit_seasonality(hst_paths: list[str]) -> dict[int, float]:
     тренда:  log(demand) ~ FE(ячейка) + t + dummies(квартал).
     Возвращает {квартал: множитель}, нормированный к среднему геометрическому 1.
     """
-    import math
     from .parser import parse_report
 
     d = pd.concat([parse_report(f)[1] for f in hst_paths], ignore_index=True)

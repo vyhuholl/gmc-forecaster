@@ -7,8 +7,10 @@ cli.py — точка входа `gmc-forecaster`. Подкоманды:
 from __future__ import annotations
 import argparse
 import json
+import os
 import sys
 from typing import Any
+import pandas as pd
 from .forecast import forecast
 from .backtest import backtest
 
@@ -34,6 +36,13 @@ def _add_forecast(sub: argparse._SubParsersAction[Any]) -> None:
     )
     fc.add_argument("--scenario", required=True, help="scenario.json")
     fc.add_argument("--out", help="сохранить прогноз в CSV")
+    fc.add_argument(
+        "--coeffs",
+        choices=["key", "full", "none"],
+        default="key",
+        help="коэффициенты модели доли: key (ключевые+наклоны), "
+        "full (+FE), none",
+    )
     fc.set_defaults(func=_cmd_forecast)
 
 
@@ -75,6 +84,54 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _sig(p: float) -> str:
+    """Звёзды значимости по p-value."""
+    return "***" if p < 0.01 else "**" if p < 0.05 else "*" if p < 0.10 else ""
+
+
+# блоки коэффициентов для режимов --coeffs
+_KEY_BLOCKS = ["const", "признак", "наклон"]
+_FE_BLOCKS = ["ячейка", "группа", "фирма", "прочее"]
+
+
+def _print_coeffs(df: pd.DataFrame, level: str) -> None:
+    """Человекочитаемый блок коэффициентов модели доли с значимостью."""
+    if level == "none":
+        return
+    cs = df.attrs.get("coef_summary")
+    fit = df.attrs.get("fit", {})
+    if cs is None or cs.empty:
+        return
+    ridge = float(fit.get("ridge", 0.0))
+    print()
+    print(
+        f"Коэффициенты модели доли (стадия 1) | R²={fit.get('r2')} "
+        f"n={fit.get('n')} edf={fit.get('edf')} | ridge λ={ridge:.3g} "
+        f"(усадка наклонов u_g к global; λ↑ = сильнее пулинг)"
+    )
+    blocks = _KEY_BLOCKS + (_FE_BLOCKS if level == "full" else [])
+    view = cs[cs["блок"].isin(blocks)]
+    print(f"  {'признак':<24}{'коэф':>8}{'ст.ош':>8}{'t':>7}{'p':>8}  знач")
+    for _, r in view.iterrows():
+        print(
+            f"  {str(r['признак']):<24}{float(r['коэф']):>8.3f}"
+            f"{float(r['ст.ош']):>8.3f}{float(r['t']):>7.2f}"
+            f"{float(r['p']):>8.3f}  {_sig(float(r['p']))}"
+        )
+    bp = cs.loc[cs["col"] == "log_price", "коэф"]
+    if not bp.empty and "доля_сцен_%" in df:
+        b = float(bp.iloc[0])
+        s = float(df["доля_сцен_%"].median())
+        print(
+            f"  Смысл: β_price={b:.2f} → эластичность доли по цене ≈ "
+            f"β_price·(1−s); при s={s:.0f}% ≈ {b * (1 - s / 100):.2f}."
+        )
+    print(
+        "  Значимость: *** p<0.01  ** p<0.05  * p<0.1 (нормальное "
+        "приближение; наклоны u_g штрафуются → приблизит.)"
+    )
+
+
 def _cmd_forecast(a: argparse.Namespace) -> None:
     scenario = json.load(open(a.scenario, encoding="utf-8"))
     df = forecast(a.current, a.train, a.history, scenario)
@@ -85,9 +142,18 @@ def _cmd_forecast(a: argparse.Namespace) -> None:
         f"(сезонный множитель объёма {m['seas_ratio']})"
     )
     print(df.to_string(index=False))
+    _print_coeffs(df, a.coeffs)
     if a.out:
         df.to_csv(a.out, index=False)
         print(f"-> {a.out}", file=sys.stderr)
+        cs = df.attrs.get("coef_summary")
+        if a.coeffs != "none" and cs is not None and not cs.empty:
+            cs = cs.copy()
+            cs["знач"] = cs["p"].map(_sig)
+            stem, ext = os.path.splitext(a.out)
+            cpath = f"{stem}.coef{ext or '.csv'}"
+            cs.to_csv(cpath, index=False)
+            print(f"-> {cpath}", file=sys.stderr)
 
 
 def _fmt(x: float | None, suffix: str = "") -> str:
