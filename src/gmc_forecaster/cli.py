@@ -11,7 +11,7 @@ import sys
 from typing import Any
 import pandas as pd
 from .forecast import forecast, DIST_K_N, DIST_K_COMM
-from .backtest import backtest
+from .backtest import backtest, per_cell_summary, _fin
 
 
 def _add_forecast(sub: argparse._SubParsersAction[Any]) -> None:
@@ -85,6 +85,12 @@ def _add_backtest(sub: argparse._SubParsersAction[Any]) -> None:
         help="файлы группы 0 для сезонности",
     )
     bt.add_argument("--out", help="сохранить детализацию по ячейкам в CSV")
+    bt.add_argument(
+        "--per-cell",
+        action="store_true",
+        help="печатать метрики по 9 ячейкам (канал × продукт); при --out "
+        "дублировать в sibling <out>.percell.csv",
+    )
     bt.set_defaults(func=_cmd_backtest)
 
 
@@ -176,6 +182,30 @@ def _fmt(x: float | None, suffix: str = "") -> str:
     return "н/д" if x is None else f"{x:.2f}{suffix}"
 
 
+def _print_per_cell(pc: pd.DataFrame) -> None:
+    """9-строчная таблица метрик по ячейкам (канал × продукт)."""
+    if pc.empty:
+        return
+    print()
+    print("По ячейкам (канал × продукт) | доля-MAE п.п., объём/спрос MAPE %:")
+    print(
+        f"  {'канал':<6}{'пр':>3}{'n':>3}{'дол.real':>9}{'дол.orc':>9}"
+        f"{'объём':>8}{'спр.real':>9}{'спр.orc':>9}{'персист':>9}"
+        f"{'сез.наив':>9}"
+    )
+    for _, r in pc.iterrows():
+        print(
+            f"  {str(r['канал']):<6}{int(r['продукт']):>3}{int(r['n']):>3}"
+            f"{_fmt(_fin(r['доля_MAE_real'])):>9}"
+            f"{_fmt(_fin(r['доля_MAE_oracle'])):>9}"
+            f"{_fmt(_fin(r['объём_MAPE'])):>8}"
+            f"{_fmt(_fin(r['спрос_MAPE_real'])):>9}"
+            f"{_fmt(_fin(r['спрос_MAPE_oracle'])):>9}"
+            f"{_fmt(_fin(r['спрос_MAPE_persist'])):>9}"
+            f"{_fmt(_fin(r['спрос_MAPE_seasnaive'])):>9}"
+        )
+
+
 def _cmd_backtest(a: argparse.Namespace) -> None:
     summary, df = backtest(a.reports, a.train or None, a.history or None)
     s = summary
@@ -195,9 +225,17 @@ def _cmd_backtest(a: argparse.Namespace) -> None:
     print("Бейзлайны спроса (MAPE):")
     print(f"  персистенция:   {_fmt(s['спрос_MAPE_persist'], '%')}")
     print(f"  сезонный наив:  {_fmt(s['спрос_MAPE_seasnaive'], '%')}")
+    pc = per_cell_summary(df) if a.per_cell else None
+    if pc is not None:
+        _print_per_cell(pc)
     if a.out:
         df.to_csv(a.out, index=False)
         print(f"-> {a.out}", file=sys.stderr)
+        if pc is not None and not pc.empty:
+            stem, ext = os.path.splitext(a.out)
+            ppath = f"{stem}.percell{ext or '.csv'}"
+            pc.to_csv(ppath, index=False)
+            print(f"-> {ppath}", file=sys.stderr)
 
 
 def main() -> None:

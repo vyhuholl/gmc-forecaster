@@ -64,6 +64,56 @@ def _mape(pred: list[float | None], act: list[float | None]) -> float | None:
     return float(np.mean([abs(p - a) / abs(a) for p, a in pa]) * 100)
 
 
+# 9 ячеек в устойчивом порядке (канал × продукт) для по-ячеечной сводки
+CELLS = [(ch, p) for ch in CHANNELS for p in (1, 2, 3)]
+
+
+def per_cell_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Метрики backtest, разложенные по 9 ячейкам (канал × продукт).
+    df — детализация из backtest(). Каждая строка: доля-MAE (п.п., своя
+    компания, real/oracle), объём-MAPE и сквозной спрос-MAPE (%) против
+    бейзлайнов. Метрика «все 8 компаний» здесь не считается (в детализации
+    только своя ячейка)."""
+
+    def col(g: pd.DataFrame, name: str) -> list[float | None]:
+        return [_fin(x) for x in g[name].tolist()]
+
+    rows: list[dict[str, Any]] = []
+    for ch, p in CELLS:
+        g = df[(df["канал"] == ch) & (df["продукт"] == p)]
+        if g.empty:
+            continue
+        rows.append(
+            {
+                "канал": ch,
+                "продукт": p,
+                "n": len(g),
+                "доля_MAE_real": _mae(
+                    col(g, "доля_real"), col(g, "доля_факт")
+                ),
+                "доля_MAE_oracle": _mae(
+                    col(g, "доля_oracle"), col(g, "доля_факт")
+                ),
+                "объём_MAPE": _mape(
+                    col(g, "объём_прогноз"), col(g, "объём_факт")
+                ),
+                "спрос_MAPE_real": _mape(
+                    col(g, "спрос_real"), col(g, "спрос_факт")
+                ),
+                "спрос_MAPE_oracle": _mape(
+                    col(g, "спрос_oracle"), col(g, "спрос_факт")
+                ),
+                "спрос_MAPE_persist": _mape(
+                    col(g, "спрос_persist"), col(g, "спрос_факт")
+                ),
+                "спрос_MAPE_seasnaive": _mape(
+                    col(g, "спрос_seasnaive"), col(g, "спрос_факт")
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _series(reports: list[str]) -> list[tuple[str, dict[str, Any], str]]:
     """Пары смежных кварталов (cur_file, meta_cur, next_file) внутри одной
     серии (одинаковые группа+компания), отсортированные по времени."""
