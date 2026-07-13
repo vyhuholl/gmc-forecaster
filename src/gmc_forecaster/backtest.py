@@ -12,7 +12,10 @@ per-cell/имидж-реклама) в FEATURES не входят -> их вли
 Ошибку раскладываем на две стадии (ломаются по-разному):
   • стадия 1 (доля): предсказанная доля vs фактическая — чистый тест логита;
   • стадия 2 (объём): sold_t/share_t × сезонность vs sold_{t+1}/share_{t+1}.
-Сквозной спрос = доля × объём, против бейзлайнов (персистенция, сезонный наив).
+Сквозной спрос — ЗАЯКОРЕННЫЙ: спрос_Q_now × сезонность × рычаг (рычаг =
+доля_сцен/доля_база из логита), против бейзлайнов (персистенция, сезонный наив).
+Наблюдаемый спрос несёт firm×cell-гетерогенность, которую логит не
+восстанавливает — прежний абсолютный доля×объём отбрасывал её и давал 15-20%.
 
 Два режима подачи входов:
   • realistic — конкуренты заморожены на Q_t, меняем только свои цену+рекламу
@@ -32,7 +35,14 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from .parser import parse_report, CHANNELS
-from .model import load_panel, ShareModel, fit_seasonality, cell_volume
+from .model import (
+    load_panel,
+    ShareModel,
+    fit_seasonality,
+    cell_volume,
+    damp_lever,
+    LEVER_K,
+)
 
 
 def _fin(x: Any) -> float | None:
@@ -169,13 +179,37 @@ def _panel_own_adspend(cell: pd.DataFrame, company: int) -> float | None:
     return _fin(row["adspend"].iloc[0]) if len(row) else None
 
 
+def _anchor_demand(
+    demand_now: float | None,
+    seas_ratio: float,
+    sh: float | None,
+    sh_base: float | None,
+    lever_k: float,
+    vol_pred: float | None,
+) -> float | None:
+    """Заякоренный прогноз спроса: наблюдаемый спрос_Q_now × сезонность × рычаг.
+    Рычаг = модельное отношение доли (сцен/база), демпфированное lever_k
+    (1.0 = полный рычаг, 0.0 = чистый сезонный наив). Наблюдаемый спрос несёт
+    всю firm×cell-гетерогенность, которую логит доли не восстанавливает (оттого
+    абсолютный доля×объём давал 15-20% MAPE). Нет наблюдаемого спроса -> откат
+    на абсолютный прогноз доля×объём."""
+    lev = damp_lever((sh / sh_base) if sh and sh_base else 1.0, lever_k)
+    if demand_now is not None:
+        return demand_now * seas_ratio * lev
+    if sh is not None and vol_pred is not None:
+        return sh / 100 * vol_pred
+    return None
+
+
 def backtest(
     reports: list[str],
     train: list[str] | None = None,
     history: list[str] | None = None,
+    lever_k: float = LEVER_K,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
     """Прогон модели по всем смежным парам кварталов в reports.
-    Возвращает (сводка, детализация по ячейкам)."""
+    Возвращает (сводка, детализация по ячейкам). lever_k — демпфер причинного
+    рычага заякоренного прогноза (1.0 = полный, 0.0 = чистый сезонный наив)."""
     pairs = _series(reports)
     if not pairs:
         raise ValueError(
@@ -242,21 +276,20 @@ def backtest(
                 )
 
                 # доля (стадия 1) — оба режима, по своей компании
+                sh_base = _own_share(model, cur_cell, company)  # Q_now
                 sh_real = _own_share(
                     model, cur_cell, company, price_next, adspend_next
                 )
                 sh_orc = _own_share(model, next_cell, company)
 
-                # сквозной спрос = доля × объём
-                d_real = (
-                    sh_real / 100 * vol_pred
-                    if sh_real is not None and vol_pred is not None
-                    else None
+                # сквозной спрос — ЗАЯКОРЕННЫЙ: спрос_Q_now × сезонность × рычаг
+                # (рычаг = доля_сцен/доля_база). Абсолютный доля×объём (старый
+                # подход) отбрасывал наблюдаемый спрос и давал 15-20% MAPE.
+                d_real = _anchor_demand(
+                    demand_now, seas_ratio, sh_real, sh_base, lever_k, vol_pred
                 )
-                d_orc = (
-                    sh_orc / 100 * vol_pred
-                    if sh_orc is not None and vol_pred is not None
-                    else None
+                d_orc = _anchor_demand(
+                    demand_now, seas_ratio, sh_orc, sh_base, lever_k, vol_pred
                 )
                 # бейзлайны
                 d_persist = demand_now

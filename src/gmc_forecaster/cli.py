@@ -11,6 +11,7 @@ import sys
 from typing import Any
 import pandas as pd
 from .forecast import forecast, DIST_K_N, DIST_K_COMM
+from .model import LEVER_K
 from .backtest import backtest, per_cell_summary, _fin
 
 
@@ -50,6 +51,13 @@ def _add_forecast(sub: argparse._SubParsersAction[Any]) -> None:
         default=DIST_K_COMM,
         help=f"коэф. эффекта комиссии дистрибьюторов (дефолт {DIST_K_COMM})",
     )
+    fc.add_argument(
+        "--lever-k",
+        type=float,
+        default=LEVER_K,
+        help=f"демпфер причинного рычага: спрос_сцен = спрос_база × "
+        f"[1+(рычаг−1)·k] (дефолт {LEVER_K}; 0 = чистый сезонный наив)",
+    )
     fc.add_argument("--out", help="сохранить прогноз в CSV")
     fc.add_argument(
         "--coeffs",
@@ -83,6 +91,13 @@ def _add_backtest(sub: argparse._SubParsersAction[Any]) -> None:
         nargs="*",
         default=[],
         help="файлы группы 0 для сезонности",
+    )
+    bt.add_argument(
+        "--lever-k",
+        type=float,
+        default=LEVER_K,
+        help=f"демпфер причинного рычага заякоренного прогноза "
+        f"(дефолт {LEVER_K}; 1 = полный рычаг, 0 = чистый сезонный наив)",
     )
     bt.add_argument("--out", help="сохранить детализацию по ячейкам в CSV")
     bt.add_argument(
@@ -155,13 +170,19 @@ def _print_coeffs(df: pd.DataFrame, level: str) -> None:
 
 def _cmd_forecast(a: argparse.Namespace) -> None:
     df = forecast(
-        a.current, a.train, a.history, k_n=a.dist_k_n, k_comm=a.dist_k_comm
+        a.current,
+        a.train,
+        a.history,
+        k_n=a.dist_k_n,
+        k_comm=a.dist_k_comm,
+        lever_k=a.lever_k,
     )
     m = df.attrs["meta"]
     print(
         f"Компания {m['company']}, группа {m['group']}: "
         f"прогноз Q{m['q_now']}->Q{m['q_next']} "
-        f"(сезонный множитель объёма {m['seas_ratio']})"
+        f"(сезонный множитель объёма {m['seas_ratio']}, "
+        f"демпфер рычага k={m['lever_k']})"
     )
     print(df.to_string(index=False))
     _print_coeffs(df, a.coeffs)
@@ -207,7 +228,9 @@ def _print_per_cell(pc: pd.DataFrame) -> None:
 
 
 def _cmd_backtest(a: argparse.Namespace) -> None:
-    summary, df = backtest(a.reports, a.train or None, a.history or None)
+    summary, df = backtest(
+        a.reports, a.train or None, a.history or None, lever_k=a.lever_k
+    )
     s = summary
     print(
         f"Бэктест: {s['n_переходов']} переходов, {s['n_ячеек']} ячеек | "

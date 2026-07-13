@@ -10,7 +10,12 @@ forecast.py — прогноз спроса на следующий кварта
   3. Берём текущее состояние рынка из current (все 8 компаний + свои продажи/доля).
   4. Читаем решения игрока с листа 'Your decisions' файла --current
      (parse_decisions) и применяем их к своей компании.
-  5. По каждой ячейке: доля(решения) × объём(с сезонной поправкой) = спрос.
+  5. По каждой ячейке ЯКОРИМ прогноз на наблюдаемый спрос:
+     спрос_сцен = спрос_текущ × сезонность × рычаг, где рычаг = модельное
+     отношение доли (сцен/база), демпфируемое lever_k. Так наблюдаемый спрос
+     несёт всю firm×cell-гетерогенность (её логит доли не восстанавливает —
+     оттого абсолютный прогноз доля×объём давал 15-20% MAPE), а модель отвечает
+     лишь за причинный сдвиг от смены решений. При lever_k=0 -> сезонный наив.
 
 Решения (цены/реклама/дистрибьюторы) больше НЕ подаются в json — они читаются
 прямо из первого листа --current (см. parser.parse_decisions). База сравнения
@@ -33,6 +38,8 @@ from .model import (
     ShareModel,
     fit_seasonality,
     cell_volume,
+    damp_lever,
+    LEVER_K,
     CH,
 )
 
@@ -104,6 +111,7 @@ def forecast(
     history: list[str],
     k_n: float = DIST_K_N,
     k_comm: float = DIST_K_COMM,
+    lever_k: float = LEVER_K,
 ) -> pd.DataFrame:
     model = ShareModel().fit(load_panel(train))
     seas = fit_seasonality(history) if history else None
@@ -169,8 +177,9 @@ def forecast(
                 k_comm,
             )
 
-            # базовый прогноз (текущие решения) и сценарный — разница = эффект рычага
-            _, d_base = _predict_cell(
+            # доли модели: база (текущие решения) и сценарий (новые решения);
+            # абсолютный спрос базы нужен лишь для отката, если спроса нет
+            sh_base, d_base_abs = _predict_cell(
                 model,
                 cell,
                 company,
@@ -180,7 +189,7 @@ def forecast(
                 price=price_now,
                 ad_mult=1.0,
             )
-            sh_sc, d_sc = _predict_cell(
+            sh_sc, _ = _predict_cell(
                 model,
                 cell,
                 company,
@@ -191,11 +200,23 @@ def forecast(
                 ad_mult=ad_mult,
                 dist_mult=dist_mult,
             )
-            delta = (
-                round((d_sc / d_base - 1) * 100, 1)
-                if d_base and d_sc
-                else None
+            # причинный рычаг = модельное отношение доли сцен/база (=1, если
+            # решения не меняли), демпфированное lever_k и ограниченное клипом
+            lever = damp_lever(sh_sc / sh_base if sh_base else 1.0, lever_k)
+            demand_now = (
+                float(orow["demand"]) if pd.notna(orow["demand"]) else None
             )
+            # ЯКОРЬ: база = наблюдаемый спрос × сезонность (сильный сез.-наив
+            # бейзлайн), сценарий = база × рычаг. Наблюдаемый спрос несёт всю
+            # firm×cell-гетерогенность, которую логит доли не восстанавливает.
+            # Нет наблюдаемого спроса -> откат на абсолютный прогноз доля×объём.
+            d_base: float | None
+            if demand_now is not None:
+                d_base = round(demand_now * seas_ratio)
+            else:
+                d_base = d_base_abs
+            d_sc = round(d_base * lever) if d_base is not None else None
+            delta = round((lever - 1.0) * 100, 1)
             out.append(
                 {
                     "канал": RU[ch],
@@ -222,6 +243,7 @@ def forecast(
         q_now=q_now,
         q_next=q_next,
         seas_ratio=round(seas_ratio, 3),
+        lever_k=lever_k,
     )
     # диагностика стадии 1: коэффициенты доли + значимость и качество подгонки
     df.attrs["coef_summary"] = model.coef_summary()
