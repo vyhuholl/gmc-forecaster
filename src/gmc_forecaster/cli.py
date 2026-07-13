@@ -6,6 +6,7 @@ cli.py — точка входа `gmc-forecaster`. Подкоманды:
 
 from __future__ import annotations
 import argparse
+import math
 import os
 import sys
 from typing import Any
@@ -155,13 +156,26 @@ def _print_coeffs(df: pd.DataFrame, level: str) -> None:
             f"{float(r['p']):>8.3f}  {_sig(float(r['p']))}"
         )
     bp = cs.loc[cs["col"] == "log_price", "коэф"]
-    if not bp.empty and "доля_сцен_%" in df:
+    if not bp.empty:
         b = float(bp.iloc[0])
-        s = float(df["доля_сцен_%"].median())
-        print(
-            f"  Смысл: β_price={b:.2f} → эластичность доли по цене ≈ "
-            f"β_price·(1−s); при s={s:.0f}% ≈ {b * (1 - s / 100):.2f}."
+        s_ser = (
+            df["доля_сцен_%"].dropna()
+            if "доля_сцен_%" in df
+            else pd.Series(dtype=float)
         )
+        s = float(s_ser.median()) if not s_ser.empty else float("nan")
+        if math.isnan(
+            s
+        ):  # доли не наблюдаемы (1-я итерация) — рычаг заимствован
+            print(
+                f"  Смысл: β_price={b:.2f} → полулог-эластичность спроса по "
+                f"цене (доли не наблюдаемы — заимствованный рычаг)."
+            )
+        else:
+            print(
+                f"  Смысл: β_price={b:.2f} → эластичность доли по цене ≈ "
+                f"β_price·(1−s); при s={s:.0f}% ≈ {b * (1 - s / 100):.2f}."
+            )
     print(
         "  Значимость: *** p<0.01  ** p<0.05  * p<0.1 (нормальное "
         "приближение; наклоны u_g штрафуются → приблизит.)"
@@ -184,6 +198,13 @@ def _cmd_forecast(a: argparse.Namespace) -> None:
         f"(сезонный множитель объёма {m['seas_ratio']}, "
         f"демпфер рычага k={m['lever_k']})"
     )
+    if m.get("mode") == "history":
+        print(
+            "⚠ 1-я итерация: своих долей рынка нет (history-рамп). Бейзлайн = "
+            "персистенция наблюдаемого спроса; рычаг решений — ЗАИМСТВОВАННАЯ "
+            "эластичность из --train (регулярные отчёты), низкая уверенность. "
+            "Доля_сцен_% не оценивается; Δ_рычаг_% = эффект своих решений."
+        )
     print(df.to_string(index=False))
     _print_coeffs(df, a.coeffs)
     if a.out:
