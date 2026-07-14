@@ -57,8 +57,45 @@ from .model import (
     LEVER_K,
     CH,
 )
+from .cost import unit_costs
 
 RU = {"EAEU": "ЕАЭС", "ASEAN": "АСЕАН", "INT": "Интернет"}
+
+
+def _add_cost_columns(
+    df: pd.DataFrame, current: str, train: list[str], history: list[str]
+) -> None:
+    """Добавляет к прогнозу колонки себестоимости/прибыли на ячейку:
+    себест_полн_ед, CM_ед, прибыль_ячейка = (цена_сцен − себест_полн_ед) ×
+    спрос_сцен. Если производственных данных нет (компания вне 1..8 /
+    history-режим) — колонки не добавляются (unit_costs -> None)."""
+    uc = unit_costs(current, train, history)
+    if uc is None:
+        return
+    inv = {v: k for k, v in RU.items()}
+    full_col: list[float | None] = []
+    cm_col: list[float | None] = []
+    profit_col: list[float | None] = []
+    for _, r in df.iterrows():
+        key = f"{inv[str(r['канал'])]}{int(r['продукт'])}"
+        u = uc.get(key)
+        price = r.get("цена_сцен")
+        demand = r.get("спрос_сцен")
+        if u is None:
+            full_col.append(None)
+            cm_col.append(None)
+            profit_col.append(None)
+            continue
+        full_col.append(round(u["full"], 2))
+        cm_col.append(round(u["cm"], 2))
+        if price is not None and demand is not None:
+            profit_col.append(round((float(price) - u["full"]) * demand))
+        else:
+            profit_col.append(None)
+    df["себест_полн_ед"] = full_col
+    df["CM_ед"] = cm_col
+    df["прибыль_ячейка"] = profit_col
+
 
 # дефолтные коэффициенты эффекта дистрибьюторов (переопределяются в сценарии)
 DIST_K_N = 0.15  # чувствительность к числу дистрибьюторов (относит. reach)
@@ -296,6 +333,8 @@ def forecast(
                 }
             )
     df = pd.DataFrame(out)
+    # себестоимость/прибыль на ячейку (если есть производственные данные)
+    _add_cost_columns(df, current, train, history)
     df.attrs["meta"] = dict(
         company=company,
         group=meta["group"],

@@ -1,7 +1,8 @@
 """
 cli.py — точка входа `gmc-forecaster`. Подкоманды:
   • forecast — прогноз спроса на следующий квартал под сценарием решений;
-  • backtest — оценка качества модели на исторических данных (без сценария).
+  • backtest — оценка качества модели на исторических данных (без сценария);
+  • cost     — полная себестоимость и contribution margin по 9 ячейкам.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import pandas as pd
 from .forecast import forecast, DIST_K_N, DIST_K_COMM
 from .model import LEVER_K
 from .backtest import backtest, per_cell_summary, _fin
+from .cost import cost, YIELD_HALFLIFE
 
 
 def _add_forecast(sub: argparse._SubParsersAction[Any]) -> None:
@@ -110,6 +112,38 @@ def _add_backtest(sub: argparse._SubParsersAction[Any]) -> None:
     bt.set_defaults(func=_cmd_backtest)
 
 
+def _add_cost(sub: argparse._SubParsersAction[Any]) -> None:
+    cs = sub.add_parser(
+        "cost",
+        help="полная себестоимость и contribution margin по 9 ячейкам",
+    )
+    cs.add_argument(
+        "--current",
+        required=True,
+        help="текущий отчёт (.xls/.xlsx) компании 1..8",
+    )
+    cs.add_argument(
+        "--train",
+        nargs="*",
+        default=[],
+        help="отчёты своей фирмы за прошлые кварталы (калибровка yield/цены)",
+    )
+    cs.add_argument(
+        "--history",
+        nargs="*",
+        default=[],
+        help="доп. отчёты своей фирмы для калибровки",
+    )
+    cs.add_argument(
+        "--yield-halflife",
+        type=float,
+        default=YIELD_HALFLIFE,
+        help=f"полураспад EWMA yield-факторов, кв. (дефолт {YIELD_HALFLIFE})",
+    )
+    cs.add_argument("--out", help="сохранить смету по ячейкам в CSV")
+    cs.set_defaults(func=_cmd_cost)
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="gmc-forecaster",
@@ -118,6 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="cmd", required=True)
     _add_forecast(sub)
     _add_backtest(sub)
+    _add_cost(sub)
     return ap
 
 
@@ -224,6 +259,12 @@ def _cmd_forecast(a: argparse.Namespace) -> None:
             f"квартала (Q{q_after}) — на прогноз Q{m['q_next']} НЕ влияет. Его "
             f"отложенный эффект — в колонке {col}."
         )
+    if "прибыль_ячейка" not in df.columns:
+        print(
+            "⚠ Себестоимость/прибыль не рассчитаны: нет производственных данных "
+            "(листы затрат отчёта относятся к компании вне 1..8 / history-"
+            "рамп). Колонки себест_полн_ед/CM_ед/прибыль_ячейка пропущены."
+        )
     print(df.to_string(index=False))
     _print_coeffs(df, a.coeffs)
     if a.out:
@@ -305,6 +346,55 @@ def _cmd_backtest(a: argparse.Namespace) -> None:
             ppath = f"{stem}.percell{ext or '.csv'}"
             pc.to_csv(ppath, index=False)
             print(f"-> {ppath}", file=sys.stderr)
+
+
+_COST_COLS = [
+    "канал",
+    "продукт",
+    "ед",
+    "цена",
+    "выручка",
+    "материал",
+    "конверсия",
+    "дистриб",
+    "накладные",
+    "себест_полн_ед",
+    "CM_ед",
+    "прибыль_полн_ед",
+]
+
+
+def _cmd_cost(a: argparse.Namespace) -> None:
+    try:
+        d = cost(
+            a.current, a.train, a.history, yield_halflife=a.yield_halflife
+        )
+    except ValueError as e:
+        print(f"⚠ {e}", file=sys.stderr)
+        sys.exit(1)
+    m = d.attrs["meta"]
+    y = d.attrs["yields"]
+    pl = d.attrs["pl_check"]
+    print(
+        f"Компания {m['company']}, группа {m['group']}: себестоимость "
+        f"{m['year']}Q{m['quarter']} | смен {m['shifts']} | спот-цена сырья "
+        f"{m['mat_price']} ерз/шт"
+    )
+    print(
+        f"yield (EWMA): брак {y['defect_rate'] * 100:.1f}%  "
+        f"болезни {y['absence_rate'] * 100:.1f}%  "
+        f"эфф.станков {y['efficiency'] * 100:.1f}%"
+    )
+    print(d[_COST_COLS].round(1).to_string(index=False))
+    print(
+        f"Сверка: смета {pl['смета']:.0f} vs факт COGS+накл "
+        f"{pl['факт_cogs_плюс_накл']:.0f} (разрыв — база материала «продано» "
+        f"vs «использовано»); машино-часы расч {pl['машино_часы_расч']:.0f} "
+        f"vs факт {pl['машино_часы_факт']:.0f}"
+    )
+    if a.out:
+        d.to_csv(a.out, index=False)
+        print(f"-> {a.out}", file=sys.stderr)
 
 
 def main() -> None:

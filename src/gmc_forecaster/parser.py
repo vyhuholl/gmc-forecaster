@@ -13,6 +13,7 @@
 """
 
 from __future__ import annotations
+from dataclasses import dataclass, field
 from typing import Any
 import pandas as pd
 
@@ -253,3 +254,188 @@ def parse_report(path: str) -> tuple[dict[str, Any], pd.DataFrame]:
     for k in ("year", "quarter", "company", "group"):
         df[k] = meta[k]
     return meta, df
+
+
+# --- позиционные схемы листов затрат (0-based (row, col)) ---
+# Выведены и провалидированы по текущим отчётам W-серии (RU-2026). Как и SCHEMA
+# листа 'W', позиции стабильны и не зависят от языка формы. Продукты 1/2/3 лежат
+# в столбцах 20/22/24 листа 'Resources and products'.
+RES_PROD_COL = {1: 20, 2: 22, 3: 24}
+RES_ROW = {  # строки триплетов «продукт 1/2/3»
+    "planned": 5,  # Запланировано
+    "produced": 6,  # Произведено
+    "defects": 7,  # Брак
+    "components": 41,  # Использовано в сборке (полуфабрикаты)
+}
+RES_SCALAR = {  # одиночные значения (row, col)
+    "assembler_avail_h": (15, 14),  # доступно часов работы сборщиков
+    "assembler_worked_h": (17, 14),  # фактически отработано часов
+    "assembler_absence_h": (16, 14),  # общее время отсутствия/болезни
+    "assemblers": (6, 13),  # сборщиков на начало прош. кв.
+    "mechanics": (6, 14),  # механиков на начало прош. кв.
+    "machines_used": (18, 6),  # станков использовалось
+    "machines_next": (20, 6),  # станков доступно для след. кв.
+    "machine_avail_h": (22, 6),  # доступных станко-часов
+    "machine_worked_h": (24, 6),  # отработано станко-часов
+    "machine_downtime_h": (23, 6),  # часов простоя станков
+    "machine_efficiency": (26, 6),  # средняя эффективность станка, %
+    "material_used": (33, 6),  # использовано сырья, шт
+    "material_purchased_units": (30, 6),  # закуплено сырья, шт
+}
+# лист 'Financial statements': накладные — метки в столбце 2, значения в 5;
+# P&L (себестоимость производства) — метки в 8, значения в 11.
+FIN_OVERHEAD_COL = 5
+FIN_OVERHEAD = {  # {ключ: row} — накладные расходы
+    "реклама": 7,
+    "интернет_агент": 8,
+    "интернет_провайдер": 9,
+    "агенты_дистриб": 10,
+    "офис_продаж": 11,
+    "гарантия": 12,
+    "rnd": 13,
+    "веб": 14,
+    "персонал": 15,
+    "техобсл": 16,
+    "склад_закупка": 17,
+    "маркет_исслед": 18,
+    "кредит_контроль": 19,
+    "страховка": 20,
+    "упр_бюджет": 21,
+    "прочие": 22,
+}
+FIN_OVERHEAD_TOTAL_ROW = 23  # Итого накладные расходы
+FIN_PL_COL = 11
+FIN_PL = {  # {ключ: row} — отчёт о прибылях/убытках (производство)
+    "revenue": 7,  # выручка от реализации
+    "components_purchased": 10,  # закупленные полуфабрикаты
+    "material_purchased": 11,  # закупленное сырьё (деньги)
+    "machine_opex": 12,  # затраты на эксплуатацию станков
+    "mechanic_salary": 13,  # зарплаты механиков
+    "assembler_salary": 14,  # зарплаты сборщиков
+    "qc": 15,  # контроль качества (ОТК)
+    "transport": 16,  # аренда транспорта
+    "cogs": 18,  # затраты на пр-во и реализацию продукции
+    "gross_profit": 19,  # валовая прибыль/убыток
+    "depreciation": 22,  # амортизация
+}
+
+
+@dataclass(frozen=True)
+class CostReport:
+    """Производственные и стоимостные данные одного отчёта (листы
+    'Resources and products' и 'Financial statements'). Всё в ерз, если не
+    указано иное; часы — станко-/человеко-часы прошлого квартала."""
+
+    group: int
+    company: int
+    year: int
+    quarter: int
+    # производство по продуктам (ключи 1/2/3)
+    produced: dict[int, float]
+    defects: dict[int, float]
+    components_used: dict[int, float]  # собрано из полуфабрикатов
+    planned: dict[int, float]
+    # сборщики / механики
+    assembler_avail_h: float
+    assembler_worked_h: float
+    assembler_absence_h: float
+    assemblers: float
+    mechanics: float
+    # станки
+    machines: float
+    machine_avail_h: float
+    machine_worked_h: float
+    machine_downtime_h: float
+    machine_efficiency: float  # %
+    # материалы (в штуках)
+    material_used: float
+    material_purchased_units: float
+    # финансы: P&L производства
+    revenue: float
+    components_purchased_cost: float
+    material_purchased_cost: float
+    machine_opex: float
+    mechanic_salary: float
+    assembler_salary: float
+    qc_cost: float
+    transport_cost: float
+    cogs: float
+    depreciation: float
+    # накладные (именованные статьи + итог)
+    overhead: dict[str, float] = field(default_factory=dict)
+    overhead_total: float = 0.0
+
+
+def parse_costs(path: str) -> CostReport:
+    """Данные затрат отчёта по позиционным схемам RES_SCHEMA/FIN_SCHEMA
+    (языконезависимо, движок calamine). Пустая/текстовая ячейка -> 0.0
+    (эффективность -> 100.0). Валидно для отчёта компании 1..8 W-серии."""
+    res = pd.read_excel(
+        path,
+        sheet_name="Resources and products",
+        header=None,
+        engine="calamine",
+    )
+    fin = pd.read_excel(
+        path,
+        sheet_name="Financial statements",
+        header=None,
+        engine="calamine",
+    )
+    meta, _ = parse_report(path)
+
+    def at(df: pd.DataFrame, r: int, c: int, default: float = 0.0) -> float:
+        try:
+            v = _num(df.iat[r, c])
+        except IndexError:
+            return default
+        return float(v) if isinstance(v, (int, float)) else default
+
+    def triple(row: int) -> dict[int, float]:
+        return {p: at(res, row, RES_PROD_COL[p]) for p in PRODUCTS}
+
+    overhead = {
+        k: at(fin, row, FIN_OVERHEAD_COL) for k, row in FIN_OVERHEAD.items()
+    }
+    return CostReport(
+        group=meta["group"],
+        company=meta["company"],
+        year=meta["year"],
+        quarter=meta["quarter"],
+        produced=triple(RES_ROW["produced"]),
+        defects=triple(RES_ROW["defects"]),
+        components_used=triple(RES_ROW["components"]),
+        planned=triple(RES_ROW["planned"]),
+        assembler_avail_h=at(res, *RES_SCALAR["assembler_avail_h"]),
+        assembler_worked_h=at(res, *RES_SCALAR["assembler_worked_h"]),
+        assembler_absence_h=at(res, *RES_SCALAR["assembler_absence_h"]),
+        assemblers=at(res, *RES_SCALAR["assemblers"]),
+        mechanics=at(res, *RES_SCALAR["mechanics"]),
+        machines=at(res, *RES_SCALAR["machines_used"]),
+        machine_avail_h=at(res, *RES_SCALAR["machine_avail_h"]),
+        machine_worked_h=at(res, *RES_SCALAR["machine_worked_h"]),
+        machine_downtime_h=at(res, *RES_SCALAR["machine_downtime_h"]),
+        machine_efficiency=at(
+            res, *RES_SCALAR["machine_efficiency"], default=100.0
+        ),
+        material_used=at(res, *RES_SCALAR["material_used"]),
+        material_purchased_units=at(
+            res, *RES_SCALAR["material_purchased_units"]
+        ),
+        revenue=at(fin, FIN_PL["revenue"], FIN_PL_COL),
+        components_purchased_cost=at(
+            fin, FIN_PL["components_purchased"], FIN_PL_COL
+        ),
+        material_purchased_cost=at(
+            fin, FIN_PL["material_purchased"], FIN_PL_COL
+        ),
+        machine_opex=at(fin, FIN_PL["machine_opex"], FIN_PL_COL),
+        mechanic_salary=at(fin, FIN_PL["mechanic_salary"], FIN_PL_COL),
+        assembler_salary=at(fin, FIN_PL["assembler_salary"], FIN_PL_COL),
+        qc_cost=at(fin, FIN_PL["qc"], FIN_PL_COL),
+        transport_cost=at(fin, FIN_PL["transport"], FIN_PL_COL),
+        cogs=at(fin, FIN_PL["cogs"], FIN_PL_COL),
+        depreciation=at(fin, FIN_PL["depreciation"], FIN_PL_COL),
+        overhead=overhead,
+        overhead_total=at(fin, FIN_OVERHEAD_TOTAL_ROW, FIN_OVERHEAD_COL),
+    )

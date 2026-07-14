@@ -1,8 +1,8 @@
-.PHONY: format lint type-check validate
+.PHONY: format lint type-check test validate
 
 RUN_CMD := uv run
 
-format: 
+format:
 	$(RUN_CMD) ruff format .
 
 lint:
@@ -11,4 +11,7 @@ lint:
 type-check:
 	$(RUN_CMD) mypy .
 
-validate: format lint type-check
+test:
+	$(RUN_CMD) pytest -q
+
+validate: format lint type-check test
