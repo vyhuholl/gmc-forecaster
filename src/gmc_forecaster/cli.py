@@ -205,6 +205,14 @@ def _cmd_forecast(a: argparse.Namespace) -> None:
             "эластичность из --train (регулярные отчёты), низкая уверенность. "
             "Доля_сцен_% не оценивается; Δ_рычаг_% = эффект своих решений."
         )
+    col = "Δ_дистриб_след_%"
+    if col in df and (df[col].fillna(0) != 0).any():
+        q_after = m["q_next"] % 4 + 1
+        print(
+            f"⚠ Дистрибьюторы: найм выходит на охват лишь со следующего "
+            f"квартала (Q{q_after}) — на прогноз Q{m['q_next']} НЕ влияет. Его "
+            f"отложенный эффект — в колонке {col}."
+        )
     print(df.to_string(index=False))
     _print_coeffs(df, a.coeffs)
     if a.out:
