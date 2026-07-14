@@ -282,6 +282,12 @@ class ShareModel:
         self.edf_ = float(np.trace(S1))
         dof = max(self.n - self.edf_, 1.0)
         sigma2 = float(resid @ resid) / dof
+        # инференс невозможен, если дисперсия остатка схлопнулась: нет
+        # наблюдений с долями (n=0) либо панель без реальной вариации фирм/цен
+        # и подгонка интерполировала данные (σ²≈0 -> ст.ош≈0 -> t огромны, p
+        # обнуляется). Типично для --train из одной истории/клонов. Тогда
+        # β/ст.ош/t/p не идентифицированы и не выводятся (см. degenerate/CLI).
+        self.degenerate = self.n == 0 or sigma2 < 1e-9
         var = np.clip(np.diag(sigma2 * (S1 @ Ainv)), 0.0, None)
         se = np.sqrt(var)
         tstat = np.divide(self.beta, se, out=np.zeros_like(se), where=se > 0)

@@ -137,6 +137,17 @@ def _print_coeffs(df: pd.DataFrame, level: str) -> None:
         return
     cs = df.attrs.get("coef_summary")
     fit = df.attrs.get("fit", {})
+    if fit.get("degenerate"):
+        print()
+        print(
+            "Коэффициенты модели доли не выводятся: --train не содержит "
+            "конкурентных данных с долями рынка (только история/клоны) — "
+            "эффекты цены/рекламы/рейтинга не идентифицируются (подгонка "
+            "вырождена: остатки схлопнуты, ст.ошибки ≈ 0, t огромны, p "
+            "обнуляются). Добавьте в --train регулярные отчёты с долями "
+            "(W…), чтобы оценить рычаг решений."
+        )
+        return
     if cs is None or cs.empty:
         return
     ridge = float(fit.get("ridge", 0.0))
@@ -219,7 +230,13 @@ def _cmd_forecast(a: argparse.Namespace) -> None:
         df.to_csv(a.out, index=False)
         print(f"-> {a.out}", file=sys.stderr)
         cs = df.attrs.get("coef_summary")
-        if a.coeffs != "none" and cs is not None and not cs.empty:
+        degenerate = bool(df.attrs.get("fit", {}).get("degenerate"))
+        if (
+            a.coeffs != "none"
+            and not degenerate
+            and cs is not None
+            and not cs.empty
+        ):
             cs = cs.copy()
             cs["знач"] = cs["p"].map(_sig)
             stem, ext = os.path.splitext(a.out)

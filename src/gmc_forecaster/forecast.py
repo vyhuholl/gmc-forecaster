@@ -311,6 +311,7 @@ def forecast(
         n=model.n,
         edf=round(model.edf_, 1),
         ridge=model.ridge_,
+        degenerate=model.degenerate,
     )
     return df
 
@@ -468,5 +469,6 @@ def _forecast_history(
         n=model.n,
         edf=round(model.edf_, 1),
         ridge=model.ridge_,
+        degenerate=model.degenerate,
     )
     return df
