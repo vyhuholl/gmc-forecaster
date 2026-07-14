@@ -1,6 +1,9 @@
 # macOS system file
 .DS_Store
 
+# LibreOffice edit artifacts
+.~lock.*#
+
 # Forecast scenario file
 scenario.json
 
