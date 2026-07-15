@@ -7,7 +7,7 @@ import glob
 import math
 from pathlib import Path
 import pytest
-from gmc_forecaster.parser import parse_costs, PRODUCTS
+from gmc_forecaster.parser import parse_costs, parse_decisions, PRODUCTS
 from gmc_forecaster.cost import (
     cost,
     unit_costs,
@@ -17,8 +17,10 @@ from gmc_forecaster.cost import (
     calibrate_yields,
     material_unit_price,
     _ewma,
+    _plan_edited,
     RAW_PER_UNIT,
     ASSEMBLY_MIN,
+    CHANNELS,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -119,3 +121,83 @@ def test_history_degradation() -> None:
     assert unit_costs(HST) is None
     with pytest.raises(ValueError):
         cost(HST)
+
+
+# ---------- вход себестоимости из РЕШЕНИЙ (change cost-from-decisions) ----------
+def test_decisions_plan_equals_planned() -> None:
+    """План поставок с листа решений (по продуктам) == planned отчёта."""
+    dec = parse_decisions(CUR)
+    c = parse_costs(CUR)
+    by_prod = {
+        p: sum(dec["plan"].get(f"{ch}{p}", 0.0) for ch in CHANNELS)
+        for p in PRODUCTS
+    }
+    assert by_prod == pytest.approx(c.planned)
+
+
+def test_decisions_assembly_time_reproduces_worked_h() -> None:
+    """Время сборки С ЛИСТА РЕШЕНИЙ × выпуск воспроизводит assembler_worked_h
+    (≤1 %), а константа мануала {100,150,300} — нет (расходится >5 %)."""
+    dec = parse_decisions(CUR)
+    c = parse_costs(CUR)
+    asm = dec["assembly_min"]
+    assert set(asm) == set(PRODUCTS)
+    h_dec = sum(c.produced[p] * asm[p] for p in PRODUCTS) / 60.0
+    h_const = sum(c.produced[p] * ASSEMBLY_MIN[p] for p in PRODUCTS) / 60.0
+    assert h_dec == pytest.approx(c.assembler_worked_h, rel=0.01)
+    assert abs(h_const / c.assembler_worked_h - 1.0) > 0.05
+
+
+def test_cost_quantity_is_plan_not_sold() -> None:
+    """Объём ячейки в смете = план поставок (не sold): напр. ASEAN2 = 70."""
+    dec = parse_decisions(CUR)
+    d = cost(CUR, train=TRAIN)
+    for _, r in d.iterrows():
+        ch = {"ЕАЭС": "EAEU", "АСЕАН": "ASEAN", "Интернет": "INT"}[
+            str(r["канал"])
+        ]
+        key = f"{ch}{int(r['продукт'])}"
+        assert r["ед"] == pytest.approx(dec["plan"][key])
+
+
+def test_reconciliation_executed_within_threshold() -> None:
+    """На предзаполненном листе (решения = исполненным) смета сходится с
+    COGS+накл в пределах inventory-шума (≤5 %); режим = исполненные."""
+    d = cost(CUR, train=TRAIN)
+    pl = d.attrs["pl_check"]
+    assert pl["применима"] is True
+    assert d.attrs["meta"]["режим"] == "исполненные"
+    gap = abs(pl["смета"] / pl["факт_cogs_плюс_накл"] - 1.0)
+    assert gap <= 0.05
+
+
+def test_forecast_base_columns_and_clip() -> None:
+    """demand добавляет колонки базы прогноза; продано клипуется ≤ план;
+    себест_полн_ед НЕ зависит от базы продаж."""
+    base = cost(CUR, train=TRAIN)
+    # EAEU1 план=1828 -> demand 1500 (ниже, берётся); INT1 план=1518 ->
+    # demand 5000 (выше, клип к плану)
+    demand = {"EAEU1": 1500.0, "INT1": 5000.0}
+    d = cost(CUR, train=TRAIN, demand=demand)
+    assert {"продано_прог", "выручка_прог", "прибыль_прог"} <= set(d.columns)
+    row = d[(d["канал"] == "ЕАЭС") & (d["продукт"] == 1)].iloc[0]
+    assert row["продано_прог"] == pytest.approx(1500.0)
+    ir = d[(d["канал"] == "Интернет") & (d["продукт"] == 1)].iloc[0]
+    assert ir["продано_прог"] == pytest.approx(ir["ед"])  # клип к плану
+    # себест/ед базонезависима
+    assert list(d["себест_полн_ед"]) == pytest.approx(
+        list(base["себест_полн_ед"])
+    )
+
+
+def test_plan_edited_mode() -> None:
+    """_plan_edited: нет плана/план=исполненному -> False; отклонение >2 % ->
+    True (форвард-оценка)."""
+    c = parse_costs(CUR)
+    planned = c.planned
+    assert _plan_edited({}, planned) is False
+    same = {f"{ch}{p}": planned[p] / 3.0 for ch in CHANNELS for p in PRODUCTS}
+    assert _plan_edited(same, planned) is False
+    bumped = dict(same)
+    bumped["EAEU1"] = planned[1]  # ~+66 % объёма продукта 1
+    assert _plan_edited(bumped, planned) is True

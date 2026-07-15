@@ -56,10 +56,17 @@ SCHEMA = {
 # Строки рекламы/дистрибьюторов и цен — по каналам; столбцы — по продуктам.
 DEC_AD_ROW = {"EAEU": 13, "ASEAN": 14, "INT": 15}  # реклама + дистрибьюторы
 DEC_PRICE_ROW = {"EAEU": 18, "ASEAN": 19, "INT": 20}
+DEC_PLAN_ROW = {"EAEU": 23, "ASEAN": 24, "INT": 25}  # план поставок по каналам
 DEC_PROD_COL = {1: 5, 2: 7, 3: 9}  # столбцы продуктов 1/2/3
 DEC_IMAGE_COL = 4  # имидж-реклама канала
 DEC_DIST_N_COL = 15  # число агентов/дистрибьюторов канала
 DEC_DIST_COMM_COL = 22  # комиссия дистрибьюторов, %
+DEC_ASM_ROW = 30  # время сборки по продуктам (мин), столбцы DEC_PROD_COL
+DEC_SHIFTS = (19, 22)  # число рабочих смен (row, col)
+DEC_ASM_HIRE = (23, 15)  # сборщики: найм(+)/увольнение(−)
+DEC_ASM_WAGE = (24, 15)  # часовая ставка сборщиков, ерз
+DEC_MACH_BUY = (30, 15)  # покупка станков, шт
+DEC_MACH_SELL = (30, 22)  # продажа станков, шт
 
 
 def _num(x: Any) -> Any:
@@ -94,12 +101,20 @@ def parse_decisions(path: str) -> dict[str, Any]:
     схеме DEC_SCHEMA (языконезависимо). Это заменяет scenario.json: игрок правит
     свои what-if цены/рекламу/дистрибьюторов прямо в Excel. Возвращает dict:
       price{ячейка}            — абс. цены (ерз) по 9 ячейкам,
+      plan{ячейка}             — план поставок (ед) по 9 ячейкам (= planned
+                                 отчёта; оборотная база себестоимости),
+      assembly_min{продукт}    — фактическое время сборки (мин/ед) по 3 продуктам
+                                 (для этой игры; сверено с assembler_worked_h),
       adspend_total            — суммарный бюджет рекламы (тыс. ерз): имидж по
                                  3 каналам + товарная по 9 ячейкам (= уровень
                                  компании модели W[adspend_base]/1000),
       dist_n{канал}            — число дистрибьюторов,
-      dist_comm{канал}         — комиссия дистрибьюторов, %.
-    Пустая ячейка -> ключ опускается (наследует текущее из --current)."""
+      dist_comm{канал}         — комиссия дистрибьюторов, %,
+      shifts                   — число рабочих смен (или None),
+      hire                     — найм(+)/увольнение(−) сборщиков (или None),
+      wage                     — часовая ставка сборщиков, ерз (или None),
+      mach_buy / mach_sell     — покупка/продажа станков, шт (или None).
+    Пустая ячейка -> ключ опускается/None (наследует текущее из --current)."""
     df = pd.read_excel(path, sheet_name=0, header=None, engine="calamine")
 
     def at(r: int, c: int) -> float | None:
@@ -109,6 +124,8 @@ def parse_decisions(path: str) -> dict[str, Any]:
             return None
 
     price: dict[str, float] = {}
+    plan: dict[str, float] = {}
+    assembly_min: dict[int, float] = {}
     dist_n: dict[str, float] = {}
     dist_comm: dict[str, float] = {}
     ad_total = 0.0
@@ -117,6 +134,9 @@ def parse_decisions(path: str) -> dict[str, Any]:
             v = at(DEC_PRICE_ROW[ch], DEC_PROD_COL[p])
             if v is not None:
                 price[f"{ch}{p}"] = v
+            pl = at(DEC_PLAN_ROW[ch], DEC_PROD_COL[p])
+            if pl is not None:
+                plan[f"{ch}{p}"] = pl
         ar = DEC_AD_ROW[ch]
         img = at(ar, DEC_IMAGE_COL)
         if img is not None:
@@ -131,11 +151,22 @@ def parse_decisions(path: str) -> dict[str, Any]:
         comm = at(ar, DEC_DIST_COMM_COL)
         if comm is not None:
             dist_comm[ch] = comm
+    for p in PRODUCTS:
+        a = at(DEC_ASM_ROW, DEC_PROD_COL[p])
+        if a is not None:
+            assembly_min[p] = a
     return {
         "price": price,
+        "plan": plan,
+        "assembly_min": assembly_min,
         "adspend_total": ad_total,
         "dist_n": dist_n,
         "dist_comm": dist_comm,
+        "shifts": at(*DEC_SHIFTS),
+        "hire": at(*DEC_ASM_HIRE),
+        "wage": at(*DEC_ASM_WAGE),
+        "mach_buy": at(*DEC_MACH_BUY),
+        "mach_sell": at(*DEC_MACH_SELL),
     }
 
 

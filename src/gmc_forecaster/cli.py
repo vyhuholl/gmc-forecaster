@@ -140,6 +140,11 @@ def _add_cost(sub: argparse._SubParsersAction[Any]) -> None:
         default=YIELD_HALFLIFE,
         help=f"полураспад EWMA yield-факторов, кв. (дефолт {YIELD_HALFLIFE})",
     )
+    cs.add_argument(
+        "--forecast",
+        help="CSV результата команды forecast: продажи для базы «прогноз» "
+        "(продано = спрос_сцен, клип ≤ план). Без флага — база «план».",
+    )
     cs.add_argument("--out", help="сохранить смету по ячейкам в CSV")
     cs.set_defaults(func=_cmd_cost)
 
@@ -361,13 +366,43 @@ _COST_COLS = [
     "себест_полн_ед",
     "CM_ед",
     "прибыль_полн_ед",
+    "прибыль_ячейка",
 ]
+_COST_COLS_FC = ["продано_прог", "выручка_прог", "прибыль_прог"]
+
+# ЕАЭС/АСЕАН/Интернет -> EAEU/ASEAN/INT (ключи demand для cost)
+_RU2EN = {"ЕАЭС": "EAEU", "АСЕАН": "ASEAN", "Интернет": "INT"}
+
+
+def _read_forecast_demand(path: str) -> dict[str, float]:
+    """Спрос по ячейкам (ключи EN 'EAEU1'..) из CSV результата forecast:
+    (канал, продукт, спрос_сцен). Пустой/битый спрос ячейки пропускается."""
+    fc = pd.read_csv(path)
+    demand: dict[str, float] = {}
+    for _, r in fc.iterrows():
+        en = _RU2EN.get(str(r.get("канал")))
+        val = r.get("спрос_сцен")
+        if en is None or pd.isna(val):
+            continue
+        demand[f"{en}{int(r['продукт'])}"] = float(val)
+    return demand
 
 
 def _cmd_cost(a: argparse.Namespace) -> None:
+    demand = _read_forecast_demand(a.forecast) if a.forecast else None
+    if demand is not None and len(demand) < 9:
+        print(
+            f"⚠ forecast-CSV покрывает {len(demand)}/9 ячеек; непокрытые "
+            "считаются на базе плана.",
+            file=sys.stderr,
+        )
     try:
         d = cost(
-            a.current, a.train, a.history, yield_halflife=a.yield_halflife
+            a.current,
+            a.train,
+            a.history,
+            yield_halflife=a.yield_halflife,
+            demand=demand,
         )
     except ValueError as e:
         print(f"⚠ {e}", file=sys.stderr)
@@ -378,20 +413,29 @@ def _cmd_cost(a: argparse.Namespace) -> None:
     print(
         f"Компания {m['company']}, группа {m['group']}: себестоимость "
         f"{m['year']}Q{m['quarter']} | смен {m['shifts']} | спот-цена сырья "
-        f"{m['mat_price']} ерз/шт"
+        f"{m['mat_price']} ерз/шт | решения: {m['режим']}"
     )
     print(
         f"yield (EWMA): брак {y['defect_rate'] * 100:.1f}%  "
         f"болезни {y['absence_rate'] * 100:.1f}%  "
         f"эфф.станков {y['efficiency'] * 100:.1f}%"
     )
-    print(d[_COST_COLS].round(1).to_string(index=False))
-    print(
-        f"Сверка: смета {pl['смета']:.0f} vs факт COGS+накл "
-        f"{pl['факт_cogs_плюс_накл']:.0f} (разрыв — база материала «продано» "
-        f"vs «использовано»); машино-часы расч {pl['машино_часы_расч']:.0f} "
-        f"vs факт {pl['машино_часы_факт']:.0f}"
-    )
+    cols = _COST_COLS + (_COST_COLS_FC if demand is not None else [])
+    print(d[cols].round(1).to_string(index=False))
+    gap = 100 * (pl["смета"] / pl["факт_cogs_плюс_накл"] - 1)
+    if pl["применима"]:
+        print(
+            f"Сверка (решения = исполненным): смета {pl['смета']:.0f} vs факт "
+            f"COGS+накл {pl['факт_cogs_плюс_накл']:.0f} ({gap:+.1f}%; остаток — "
+            f"inventory-шум: COGS=проданное, смета=произведённое); машино-часы "
+            f"расч {pl['машино_часы_расч']:.0f} vs факт {pl['машино_часы_факт']:.0f}"
+        )
+    else:
+        print(
+            f"Сверка неприменима: решения отредактированы (форвард-оценка "
+            f"себестоимости следующего квартала). Смета {pl['смета']:.0f}; "
+            f"машино-часы расч {pl['машино_часы_расч']:.0f}."
+        )
     if a.out:
         d.to_csv(a.out, index=False)
         print(f"-> {a.out}", file=sys.stderr)

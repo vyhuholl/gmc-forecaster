@@ -196,20 +196,31 @@ def material_unit_price(
 
 
 # ---------- разнесение затрат на 9 ячеек ----------
-def _cell_frame(current: str) -> pd.DataFrame:
-    """Единицы (проданные) и цена по 9 ячейкам из листа 'W' (parse_report)."""
+def _cell_frame(
+    current: str, plan: dict[str, float], prices: dict[str, float]
+) -> pd.DataFrame:
+    """Единицы и цена по 9 ячейкам из РЕШЕНИЙ игрока: объём = план поставок
+    (plan{ячейка}), цена = решение (prices{ячейка}). Пустая ячейка решения →
+    фоллбэк на факт листа 'W' (shipped/price) — наследование текущего."""
     _, own = parse_report(current)
     rows = []
     for _, r in own.iterrows():
-        sold = float(r["sold"]) if pd.notna(r["sold"]) else 0.0
-        price = float(r["price"]) if pd.notna(r["price"]) else 0.0
+        ch = str(r["channel"])
+        p = int(r["product"])
+        key = f"{ch}{p}"
+        units = plan.get(key)
+        if units is None:  # фоллбэк: фактически поставлено
+            units = float(r["shipped"]) if pd.notna(r["shipped"]) else 0.0
+        price = prices.get(key)
+        if price is None:  # фоллбэк: цена листа 'W'
+            price = float(r["price"]) if pd.notna(r["price"]) else 0.0
         rows.append(
             {
-                "channel": r["channel"],
-                "product": int(r["product"]),
-                "units": sold,
-                "price": price,
-                "revenue": price * sold,
+                "channel": ch,
+                "product": p,
+                "units": float(units),
+                "price": float(price),
+                "revenue": float(price) * float(units),
             }
         )
     return pd.DataFrame(rows)
@@ -221,9 +232,20 @@ def _allocate(
     mat_price: float,
     yields: dict[str, float],
     dist_comm: dict[str, float],
+    assembly_min: dict[int, float],
+    ad_override: float | None,
+    shifts_override: int | None,
+    machines: float,
+    demand: dict[str, float] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """Разносит все включённые затраты на 9 ячеек и возвращает (df, пулы).
-    df дополняется колонками затрат (всего по ячейке) и per-unit выходами."""
+    Объём/ячейка и цена — из решений (df уже собран `_cell_frame`); веса
+    конверсии — по ФАКТИЧЕСКОМУ времени сборки решений (`assembly_min`, фоллбэк —
+    константа мануала); число смен и парк станков — из решений (`shifts_override`,
+    `machines`); реклама → маркетинговые накладные из решений (`ad_override`).
+    Себест/ед и CM/ед считаются на базе ПЛАНА (производственный прогон) и НЕ
+    зависят от базы продаж. При заданном `demand` (продано по ячейкам) добавляются
+    реализационные колонки на базе прогноза (продано = min(demand, план))."""
     d = df.copy()
     n = len(d)
     units = d["units"].to_numpy(dtype=float)
@@ -238,21 +260,27 @@ def _allocate(
 
     # --- производственный фикс-пул (конверсия) по СБОРЩИКО-МИНУТАМ ---
     # состав: зарплаты сборщиков/механиков, эксплуатация станков (реконстр. по
-    # сменам, volume-responsive), амортизация, ОТК; болезни ↑ трудовую часть
+    # сменам решения, volume-responsive), амортизация, ОТК; болезни ↑ труд.часть.
+    # Веса — по фактическому времени сборки решений (константа лишь как фоллбэк).
     total_units = float(sum(cur.produced.values()))
     mh = machine_hours(
         cur.produced, cur.components_used, cur.machine_efficiency
     )
-    shifts = shifts_needed(mh, cur.machines)
-    machine_opex = reconstruct_machine_opex(
-        cur.machines, shifts, mh, total_units
+    shifts = (
+        shifts_override
+        if shifts_override is not None
+        else shifts_needed(mh, machines)
     )
-    depreciation = cur.machines * MACHINE_COST * DEPRECIATION_RATE
+    machine_opex = reconstruct_machine_opex(machines, shifts, mh, total_units)
+    depreciation = machines * MACHINE_COST * DEPRECIATION_RATE
     labor = (cur.assembler_salary + cur.mechanic_salary) * yields[
         "absence_infl"
     ]
     conv_pool = labor + machine_opex + depreciation + total_units * QC_PER_UNIT
-    asm_min = units * np.array([ASSEMBLY_MIN[int(p)] for p in prod])
+    asm_pu = np.array(
+        [assembly_min.get(int(p), ASSEMBLY_MIN[int(p)]) for p in prod]
+    )
+    asm_min = units * asm_pu
     w_conv = asm_min / asm_min.sum() if asm_min.sum() > 0 else np.zeros(n)
     conversion = conv_pool * w_conv
 
@@ -277,9 +305,12 @@ def _allocate(
         if u_c > 0:
             channel[m] += pool_c * units[m] / u_c
 
-    # --- overhead (маркетинг + прочие непроизв.) по ВЫРУЧКЕ ячейки ---
+    # --- overhead (маркетинг + прочие непроизв.) по ВЫРУЧКЕ ячейки; рекламу
+    # заменяем бюджетом решений (ad_override), если задан ---
     used = set(_INT_OVERHEAD) | set(_CHANNEL_OVERHEAD)
     oh_pool = sum(v for k, v in cur.overhead.items() if k not in used)
+    if ad_override is not None:
+        oh_pool += ad_override - cur.overhead.get("реклама", 0.0)
     w_rev = revenue / rev_tot if rev_tot > 0 else np.zeros(n)
     overhead = oh_pool * w_rev
 
@@ -303,6 +334,19 @@ def _allocate(
     d["CM_ед"] = cm_pu
     d["комиссия_ед"] = comm_pu
     d["прибыль_полн_ед"] = price - full_pu
+    # база=план: реализация на проданном = плану поставок
+    d["прибыль_ячейка"] = (price - full_pu) * units
+    # база=прогноз (опц.): продано = min(спрос_сцен, план); себест/ед та же
+    if demand is not None:
+        sold = np.array(
+            [
+                min(demand.get(f"{ch[i]}{int(prod[i])}", units[i]), units[i])
+                for i in range(n)
+            ]
+        )
+        d["продано_прог"] = sold
+        d["выручка_прог"] = price * sold
+        d["прибыль_прог"] = (price - full_pu) * sold
 
     pools = {
         "материал": float(material.sum()),
@@ -332,16 +376,35 @@ def _own_cost_series(
     return out
 
 
+def _plan_edited(plan: dict[str, float], planned: dict[int, float]) -> bool:
+    """Отредактирован ли план решений относительно исполненного (`planned`
+    отчёта). Нет плана в решениях → считаем исполненным (False). Порог 2 %
+    суммарного отклонения по продуктам (мелкие расхождения — округление/
+    капасити-обрезка отчёта)."""
+    if not plan:
+        return False
+    by_prod = {
+        p: sum(plan.get(f"{ch}{p}", 0.0) for ch in CHANNELS) for p in PRODUCTS
+    }
+    tot = sum(planned.values()) or 1.0
+    diff = sum(abs(by_prod[p] - planned.get(p, 0.0)) for p in PRODUCTS)
+    return diff / tot > 0.02
+
+
 def cost(
     current: str,
     train: list[str] | None = None,
     history: list[str] | None = None,
     yield_halflife: float = YIELD_HALFLIFE,
+    demand: dict[str, float] | None = None,
 ) -> pd.DataFrame:
-    """Себестоимость решения по 9 ячейкам. Возвращает df (ед/цена/выручка,
-    компоненты затрат, себест_полн_ед, CM_ед, прибыль_полн_ед) + df.attrs
-    (meta, пулы, yields, сверка с фактом P&L). yield-факторы и спот-цена сырья
-    калибруются по кварталам СВОЕЙ фирмы из current+train+history (EWMA)."""
+    """Себестоимость РЕШЕНИЯ по 9 ячейкам (объём = план поставок, цены/реклама/
+    комиссии/смены/станки — с листа 'Your decisions'). Возвращает df (ед/цена/
+    выручка, компоненты затрат, себест_полн_ед, CM_ед, прибыль_полн_ед,
+    прибыль_ячейка) + df.attrs (meta, пулы, yields, двухрежимная сверка с P&L).
+    yield-факторы и спот-цена сырья калибруются по кварталам СВОЕЙ фирмы из
+    current+train+history (EWMA). При `demand` (продано по ячейкам, ключи EN
+    'EAEU1'..) добавляются реализационные колонки на базе прогноза."""
     cur = parse_costs(current)
     if not 1 <= cur.company <= 8:
         raise ValueError(
@@ -362,15 +425,39 @@ def cost(
             if len(v):
                 dist_comm[chn] = float(v.iloc[0])
 
-    df = _cell_frame(current)
-    d, pools = _allocate(df, cur, mat_price, yields, dist_comm)
+    # производственные решения: смены, парк станков, реклама
+    shifts_override = (
+        int(dec["shifts"]) if dec["shifts"] not in (None, 0) else None
+    )
+    machines = (
+        cur.machines + (dec["mach_buy"] or 0.0) - (dec["mach_sell"] or 0.0)
+    )
+    ad = float(dec["adspend_total"])
+    ad_override = ad * 1000.0 if ad > 0 else None
+
+    df = _cell_frame(current, dec["plan"], dec["price"])
+    d, pools = _allocate(
+        df,
+        cur,
+        mat_price,
+        yields,
+        dist_comm,
+        dec["assembly_min"],
+        ad_override,
+        shifts_override,
+        machines,
+        demand,
+    )
     d = d.rename(
         columns={"units": "ед", "price": "цена", "revenue": "выручка"}
     )
     d.insert(0, "продукт", d.pop("product"))
     d.insert(0, "канал", d.pop("channel").map(RU))
 
-    # сверка сметы с фактом P&L: полная себестоимость vs (COGS + накладные)
+    # двухрежимная сверка сметы с фактом P&L: смета (производственный прогон) vs
+    # (COGS + накладные). Решения = исполненным → должна сходиться (inventory-
+    # шум); отредактированы → форвард-оценка, сверка неприменима.
+    edited = _plan_edited(dec["plan"], cur.planned)
     pl_actual = cur.cogs + cur.overhead_total
     d.attrs["meta"] = dict(
         company=cur.company,
@@ -379,6 +466,7 @@ def cost(
         quarter=cur.quarter,
         shifts=int(pools["смены"]),
         mat_price=round(mat_price, 2),
+        режим="форвард" if edited else "исполненные",
     )
     d.attrs["yields"] = {k: round(v, 4) for k, v in yields.items()}
     d.attrs["pools"] = {k: round(v, 1) for k, v in pools.items()}
@@ -387,6 +475,7 @@ def cost(
         факт_cogs_плюс_накл=round(pl_actual, 0),
         машино_часы_факт=round(cur.machine_worked_h, 0),
         машино_часы_расч=round(pools["машино_часы"], 0),
+        применима=not edited,
     )
     return d
 
