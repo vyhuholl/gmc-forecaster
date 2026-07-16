@@ -38,10 +38,12 @@ from .parser import parse_report, CHANNELS
 from .model import (
     load_panel,
     ShareModel,
-    fit_seasonality,
+    resolve_seasonality,
     cell_volume,
     damp_lever,
+    level_factor,
     LEVER_K,
+    GAP_TAU,
 )
 
 
@@ -186,16 +188,20 @@ def _anchor_demand(
     sh_base: float | None,
     lever_k: float,
     vol_pred: float | None,
+    share_now: float | None = None,
+    mode: str = "auto",
+    gap_tau: float = GAP_TAU,
 ) -> float | None:
-    """Заякоренный прогноз спроса: наблюдаемый спрос_Q_now × сезонность × рычаг.
-    Рычаг = модельное отношение доли (сцен/база), демпфированное lever_k
-    (1.0 = полный рычаг, 0.0 = чистый сезонный наив). Наблюдаемый спрос несёт
-    всю firm×cell-гетерогенность, которую логит доли не восстанавливает (оттого
-    абсолютный доля×объём давал 15-20% MAPE). Нет наблюдаемого спроса -> откат
-    на абсолютный прогноз доля×объём."""
+    """Заякоренный прогноз спроса: наблюдаемый спрос_Q_now × сезонность × рычаг
+    × авто-уровень. Рычаг = модельное отношение доли (сцен/база), демпфированное
+    lever_k (1.0 = полный, 0.0 = сезонный наив). Наблюдаемый спрос несёт
+    firm×cell-гетерогенность, которую логит доли не восстанавливает; авто-уровень
+    (level_factor по разрыву набл/база) сдвигает уровень к модельной доле на
+    рампе. Нет наблюдаемого спроса -> откат на абсолютный прогноз доля×объём."""
     lev = damp_lever((sh / sh_base) if sh and sh_base else 1.0, lever_k)
+    lvl = level_factor(share_now, sh_base, mode, gap_tau)
     if demand_now is not None:
-        return demand_now * seas_ratio * lev
+        return demand_now * seas_ratio * lev * lvl
     if sh is not None and vol_pred is not None:
         return sh / 100 * vol_pred
     return None
@@ -206,10 +212,16 @@ def backtest(
     train: list[str] | None = None,
     history: list[str] | None = None,
     lever_k: float = LEVER_K,
+    mode: str = "auto",
+    gap_tau: float = GAP_TAU,
+    seasonality: str = "auto",
 ) -> tuple[dict[str, Any], pd.DataFrame]:
     """Прогон модели по всем смежным парам кварталов в reports.
     Возвращает (сводка, детализация по ячейкам). lever_k — демпфер причинного
-    рычага заякоренного прогноза (1.0 = полный, 0.0 = чистый сезонный наив)."""
+    рычага заякоренного прогноза (1.0 = полный, 0.0 = чистый сезонный наив).
+    mode — авто-уровень доли (auto/anchored/absolute, см. model.level_factor);
+    gap_tau — толерантность к разрыву доли в режиме auto; seasonality — источник
+    сезонности (auto/market/history/none, см. model.resolve_seasonality)."""
     pairs = _series(reports)
     if not pairs:
         raise ValueError(
@@ -217,7 +229,9 @@ def backtest(
             "(нужны отчёты одной серии за соседние кварталы)"
         )
     model = ShareModel().fit(load_panel(train or reports))
-    seas = fit_seasonality(history) if history else None
+    seas, seas_src = resolve_seasonality(
+        seasonality, train or reports, history or []
+    )
 
     detail: list[dict[str, Any]] = []
     share_err_all: list[float] = []  # |доля_oracle − факт| по всем 8 компаниям
@@ -286,10 +300,26 @@ def backtest(
                 # (рычаг = доля_сцен/доля_база). Абсолютный доля×объём (старый
                 # подход) отбрасывал наблюдаемый спрос и давал 15-20% MAPE.
                 d_real = _anchor_demand(
-                    demand_now, seas_ratio, sh_real, sh_base, lever_k, vol_pred
+                    demand_now,
+                    seas_ratio,
+                    sh_real,
+                    sh_base,
+                    lever_k,
+                    vol_pred,
+                    share_now,
+                    mode,
+                    gap_tau,
                 )
                 d_orc = _anchor_demand(
-                    demand_now, seas_ratio, sh_orc, sh_base, lever_k, vol_pred
+                    demand_now,
+                    seas_ratio,
+                    sh_orc,
+                    sh_base,
+                    lever_k,
+                    vol_pred,
+                    share_now,
+                    mode,
+                    gap_tau,
                 )
                 # бейзлайны
                 d_persist = demand_now
@@ -339,6 +369,8 @@ def backtest(
         "группы": sorted(df["группа"].unique().tolist()),
         "компании": sorted(df["компания"].unique().tolist()),
         "сезонность": seas is not None,
+        "сезонность_ист": seas_src,
+        "режим": mode,
         # стадия 1 — доля, MAE в процентных пунктах
         "доля_MAE_своя_real": _mae(col("доля_real"), col("доля_факт")),
         "доля_MAE_своя_oracle": _mae(col("доля_oracle"), col("доля_факт")),

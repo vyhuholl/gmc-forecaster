@@ -51,10 +51,13 @@ from .parser import parse_report, parse_decisions
 from .model import (
     load_panel,
     ShareModel,
-    fit_seasonality,
+    resolve_seasonality,
     cell_volume,
     damp_lever,
+    level_factor,
+    gap_weight,
     LEVER_K,
+    GAP_TAU,
     CH,
 )
 from .cost import unit_costs
@@ -166,9 +169,12 @@ def forecast(
     k_n: float = DIST_K_N,
     k_comm: float = DIST_K_COMM,
     lever_k: float = LEVER_K,
+    mode: str = "auto",
+    gap_tau: float = GAP_TAU,
+    seasonality: str = "auto",
 ) -> pd.DataFrame:
     model = ShareModel().fit(load_panel(train))
-    seas = fit_seasonality(history) if history else None
+    seas, seas_src = resolve_seasonality(seasonality, train, history)
 
     meta, own = parse_report(current)
     company = meta["company"]
@@ -191,6 +197,7 @@ def forecast(
             k_n,
             k_comm,
             lever_k,
+            seas_src,
         )
 
     cur_panel = load_panel([current])
@@ -301,13 +308,30 @@ def forecast(
             demand_now = (
                 float(orow["demand"]) if pd.notna(orow["demand"]) else None
             )
-            # ЯКОРЬ: база = наблюдаемый спрос × сезонность (сильный сез.-наив
-            # бейзлайн), сценарий = база × рычаг. Наблюдаемый спрос несёт всю
-            # firm×cell-гетерогенность, которую логит доли не восстанавливает.
+            # АВТО-УРОВЕНЬ ДОЛИ: разрыв gap = набл_доля/доля_база (sh_base).
+            # gap≈1 → якорь; gap далёк → фирма вне режима (рамп) → сдвиг уровня
+            # к модельной доле. factor=1 в anchored и когда доли нет.
+            gap = (
+                (share_now / sh_base)
+                if share_now and sh_base and share_now > 0 and sh_base > 0
+                else None
+            )
+            lvl = level_factor(share_now, sh_base, mode, gap_tau)
+            # вес доверия якорю (наблюдаемому спросу): anchored=1, absolute=0,
+            # auto=gap_weight (по клипованному разрыву, как в level_factor)
+            if mode == "anchored" or gap is None:
+                w = 1.0
+            elif mode == "absolute":
+                w = 0.0
+            else:
+                w = gap_weight(min(max(gap, 0.1), 10.0), gap_tau)
+            # ЯКОРЬ: база = наблюдаемый спрос × сезонность × авто-уровень.
+            # Наблюдаемый спрос несёт firm×cell-гетерогенность (её логит доли не
+            # восстанавливает); авто-уровень сдвигает к модельной доле на рампе.
             # Нет наблюдаемого спроса -> откат на абсолютный прогноз доля×объём.
             d_base: float | None
             if demand_now is not None:
-                d_base = round(demand_now * seas_ratio)
+                d_base = round(demand_now * seas_ratio * lvl)
             else:
                 d_base = d_base_abs
             d_sc = round(d_base * lever) if d_base is not None else None
@@ -330,6 +354,8 @@ def forecast(
                     "спрос_сцен": d_sc,
                     "Δ_рычаг_%": delta,
                     "Δ_дистриб_след_%": round((dist_lever - 1.0) * 100, 1),
+                    "разрыв_доли": round(gap, 2) if gap is not None else None,
+                    "вес_якоря": round(w, 2),
                 }
             )
     df = pd.DataFrame(out)
@@ -341,7 +367,10 @@ def forecast(
         q_now=q_now,
         q_next=q_next,
         seas_ratio=round(seas_ratio, 3),
+        seasonality=seas_src,
         lever_k=lever_k,
+        mode=mode,
+        gap_tau=gap_tau,
     )
     # диагностика стадии 1: коэффициенты доли + значимость и качество подгонки
     df.attrs["coef_summary"] = model.coef_summary()
@@ -391,6 +420,7 @@ def _forecast_history(
     k_n: float,
     k_comm: float,
     lever_k: float,
+    seas_src: str = "none",
 ) -> pd.DataFrame:
     """Прогноз 1-й итерации half-final: только history-рамп своей компании, БЕЗ
     долей рынка. Бейзлайн спроса = ПЕРСИСТЕНЦИЯ наблюдаемого спроса по ячейке
@@ -498,6 +528,7 @@ def _forecast_history(
         q_now=q_now,
         q_next=q_next,
         seas_ratio=round(seas_ratio, 3),
+        seasonality=seas_src,
         lever_k=lever_k,
         mode="history",  # 1-я итерация: бейзлайн + заимствованный рычаг
     )

@@ -37,11 +37,18 @@ __all__ = [
     "load_panel",
     "ShareModel",
     "fit_seasonality",
+    "fit_market_seasonality",
+    "resolve_seasonality",
     "cell_volume",
     "counterfactual",
     "predict_demand",
     "damp_lever",
+    "gap_weight",
+    "level_factor",
     "LEVER_K",
+    "GAP_TAU",
+    "MODES",
+    "SEASONALITY",
     "CH",
 ]
 
@@ -65,6 +72,58 @@ def damp_lever(ratio: float, k: float) -> float:
     множители спроса от вырожденных фитов модели доли."""
     lev = 1.0 + (ratio - 1.0) * k
     return min(max(lev, LEVER_CLIP[0]), LEVER_CLIP[1])
+
+
+# --- авто-выбор уровня доли: anchored (набл.) ↔ absolute (модель) -----------
+# Якорь держит фирму на НАБЛЮДАЕМОМ спросе — верно, пока наблюдаемая
+# firm×cell-гетерогенность персистентна (зрелая фирма). На РАМПЕ/входе
+# наблюдаемая доля сильно ниже модельной (доля_база) и якорь замораживает
+# транзиент → сильное занижение (см. docs/FINDINGS.md, half-final gr.17).
+# Признак — разрыв gap = набл_доля/доля_база: gap≈1 равновесие (доверяй якорю),
+# gap далёк от 1 — фирма вне режима (доверяй модели). Бленд одним множителем к
+# заякоренной базе: factor = gap^(w−1), где w∈[0,1] — «персистентность разрыва».
+#   w=1 (gap≈1) → factor=1                 → anchored (без изменений)
+#   w=0 (gap далёк) → factor=доля_база/набл → absolute (доля_модель × рынок)
+GAP_TAU = (
+    0.5  # ширина толерантности к |ln gap| (в лог-долях); ↑ → ближе к якорю
+)
+GAP_CLIP = (0.1, 10.0)  # клип gap до расчёта w — бинды экстраполяции модели
+MODES = ("auto", "anchored", "absolute")
+SEASONALITY = ("auto", "market", "history", "none")
+
+
+def gap_weight(gap: float | None, tau: float = GAP_TAU) -> float:
+    """Вес персистентности разрыва доли w∈(0,1]: гауссиана по ln(gap).
+    w=1 при gap=1 (равновесие → якорь), убывает по мере отклонения gap от 1
+    (фирма вне режима → модель). tau — толерантность в лог-долях."""
+    if gap is None or gap <= 0 or tau <= 0:
+        return 1.0
+    return math.exp(-(math.log(gap) ** 2) / (2.0 * tau * tau))
+
+
+def level_factor(
+    share_now: float | None,
+    share_base: float | None,
+    mode: str = "auto",
+    tau: float = GAP_TAU,
+) -> float:
+    """Множитель к ЗАЯКОРЕННОЙ базе спроса, сдвигающий УРОВЕНЬ доли между
+    наблюдаемым (anchored) и модельным (absolute) по разрыву gap=набл/база.
+      anchored → 1.0 (якорь как есть)
+      absolute → gap^(−1) = доля_база/набл (перевод уровня к модельной доле)
+      auto     → gap^(w−1), w=gap_weight(gap): равновесие=якорь, рамп=модель
+    Нет наблюдаемой/модельной доли (или ≤0) → 1.0 (откат на якорь)."""
+    if (
+        mode == "anchored"
+        or not share_now
+        or not share_base
+        or share_now <= 0
+        or share_base <= 0
+    ):
+        return 1.0
+    gap = min(max(share_now / share_base, GAP_CLIP[0]), GAP_CLIP[1])
+    w = 0.0 if mode == "absolute" else gap_weight(gap, tau)
+    return float(gap ** (w - 1.0))
 
 
 # ---------- извлечение панели 8 компаний ----------
@@ -382,6 +441,82 @@ def fit_seasonality(hst_paths: list[str]) -> dict[int, float]:
     gammas = {q: coef.get(f"q_{q}", 0.0) for q in (1, 2, 3, 4)}
     gm = math.exp(sum(gammas.values()) / 4)
     return {q: math.exp(gammas[q]) / gm for q in (1, 2, 3, 4)}
+
+
+def fit_market_seasonality(paths: list[str]) -> dict[int, float]:
+    """
+    Сезонность РЫНКА (вкл. тренд) из конкурентных отчётов. Рынок ячейки =
+    свой_спрос/(своя_доля/100) убирает вариацию своей доли, оставляя динамику
+    рынка (сезон + жизненный цикл + агрегат конкуренции). Модель:
+    log(рынок) ~ FE(серия×ячейка) + dummies(квартал). Тренд НЕ отделяется — для
+    прогноза внутри того же года нужен ПОЛНЫЙ множитель рынка кв→кв (иначе
+    сезонный рост занижается). Возвращает {квартал: множитель}, геомеан 1.
+    Годится, когда --train одногодичный (у нас 2026); пусто/<2 кварталов → {}.
+    Мотив: групповая history (fit_seasonality) в half-final — это РАМП входа по
+    каналам, а не сезонность (даёт ложный Q3-пик); train-рынок 2026 — верный
+    источник для прогноза 2026 (см. docs/FINDINGS.md §19).
+    """
+    from .parser import parse_report
+
+    rows: list[tuple[str, int, float]] = []
+    for f in paths:
+        try:
+            m, df = parse_report(f)
+        except Exception:
+            continue
+        if not 1 <= int(m["company"]) <= 8:
+            continue
+        ser = f"{int(m['group'])}_{int(m['company'])}"
+        for _, r in df.iterrows():
+            d, s = r["demand"], r["share_own"]
+            if pd.notna(d) and pd.notna(s) and s > 0 and d > 0:
+                sc = f"{ser}|{r['channel']}{int(r['product'])}"
+                rows.append((sc, int(r["quarter"]), math.log(d / (s / 100))))
+    if not rows:
+        return {}
+    d2 = pd.DataFrame(rows, columns=["sc", "quarter", "ln"])
+    if d2["quarter"].nunique() < 2:
+        return {}
+    scd = pd.get_dummies(d2["sc"], drop_first=True).astype(float)
+    qd = pd.get_dummies(d2["quarter"], prefix="q", drop_first=True).astype(
+        float
+    )
+    X = pd.concat(
+        [scd.reset_index(drop=True), qd.reset_index(drop=True)], axis=1
+    )
+    coef = dict(zip(X.columns, LinearRegression().fit(X, d2["ln"]).coef_))
+    gammas = {q: coef.get(f"q_{q}", 0.0) for q in (1, 2, 3, 4)}
+    gm = math.exp(sum(gammas.values()) / 4)
+    return {q: math.exp(gammas[q]) / gm for q in (1, 2, 3, 4)}
+
+
+def resolve_seasonality(
+    mode: str, market_paths: list[str], history_paths: list[str]
+) -> tuple[dict[int, float] | None, str]:
+    """Выбор источника сезонности. Возвращает (факторы|None, источник).
+      market  — рынок из конкурентных отчётов (fit_market_seasonality)
+      history — объём группы-0 из --history (fit_seasonality)
+      none    — без сезонности (множитель 1)
+      auto    — market, если идентифицируется (одногодичный train ≥2 кв.),
+                иначе history (если задан), иначе none.
+    В half-final --history = рамп входа, не сезонность → auto предпочитает
+    train-рынок 2026 (верный для прогноза 2026)."""
+    if mode == "none":
+        return None, "none"
+    if mode == "history":
+        if history_paths:
+            return fit_seasonality(history_paths), "history"
+        return None, "none"
+    if mode == "market":
+        s = fit_market_seasonality(market_paths) if market_paths else {}
+        return (s, "market") if s else (None, "none")
+    # auto
+    s = fit_market_seasonality(market_paths) if market_paths else {}
+    if s:
+        return s, "market"
+    if history_paths:
+        return fit_seasonality(history_paths), "history"
+    return None, "none"
 
 
 def cell_volume(own_sold: float, own_share_pct: float) -> float | None:

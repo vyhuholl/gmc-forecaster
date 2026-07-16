@@ -13,7 +13,7 @@ import sys
 from typing import Any
 import pandas as pd
 from .forecast import forecast, DIST_K_N, DIST_K_COMM
-from .model import LEVER_K
+from .model import LEVER_K, GAP_TAU, MODES, SEASONALITY
 from .backtest import backtest, per_cell_summary, _fin
 from .cost import cost, YIELD_HALFLIFE
 
@@ -61,6 +61,29 @@ def _add_forecast(sub: argparse._SubParsersAction[Any]) -> None:
         help=f"демпфер причинного рычага: спрос_сцен = спрос_база × "
         f"[1+(рычаг−1)·k] (дефолт {LEVER_K}; 0 = чистый сезонный наив)",
     )
+    fc.add_argument(
+        "--mode",
+        choices=list(MODES),
+        default="auto",
+        help="уровень доли: auto (по разрыву набл/модель — авто-выбор), "
+        "anchored (всегда наблюдаемый спрос), absolute (всегда доля модели × "
+        "рынок) (дефолт auto)",
+    )
+    fc.add_argument(
+        "--gap-tau",
+        type=float,
+        default=GAP_TAU,
+        help=f"толерантность к разрыву доли в режиме auto (дефолт {GAP_TAU}; "
+        f"↑ → ближе к anchored, ↓ → быстрее к absolute)",
+    )
+    fc.add_argument(
+        "--seasonality",
+        choices=list(SEASONALITY),
+        default="auto",
+        help="источник сезонности рынка: market (из --train, рынок="
+        "свой_спрос/своя_доля), history (группа 0 из --history), none, "
+        "auto (market если определим, иначе history) (дефолт auto)",
+    )
     fc.add_argument("--out", help="сохранить прогноз в CSV")
     fc.add_argument(
         "--coeffs",
@@ -101,6 +124,26 @@ def _add_backtest(sub: argparse._SubParsersAction[Any]) -> None:
         default=LEVER_K,
         help=f"демпфер причинного рычага заякоренного прогноза "
         f"(дефолт {LEVER_K}; 1 = полный рычаг, 0 = чистый сезонный наив)",
+    )
+    bt.add_argument(
+        "--mode",
+        choices=list(MODES),
+        default="auto",
+        help="уровень доли: auto/anchored/absolute (дефолт auto; "
+        "см. forecast --mode)",
+    )
+    bt.add_argument(
+        "--gap-tau",
+        type=float,
+        default=GAP_TAU,
+        help=f"толерантность к разрыву доли в режиме auto (дефолт {GAP_TAU})",
+    )
+    bt.add_argument(
+        "--seasonality",
+        choices=list(SEASONALITY),
+        default="auto",
+        help="источник сезонности: market/history/none/auto (дефолт auto; "
+        "см. forecast --seasonality)",
     )
     bt.add_argument("--out", help="сохранить детализацию по ячейкам в CSV")
     bt.add_argument(
@@ -241,14 +284,37 @@ def _cmd_forecast(a: argparse.Namespace) -> None:
         k_n=a.dist_k_n,
         k_comm=a.dist_k_comm,
         lever_k=a.lever_k,
+        mode=a.mode,
+        gap_tau=a.gap_tau,
+        seasonality=a.seasonality,
     )
     m = df.attrs["meta"]
+    mode_note = (
+        f", режим {m['mode']}"
+        + (f" τ={m['gap_tau']}" if m.get("mode") == "auto" else "")
+        if m.get("mode") in MODES
+        else ""
+    )
     print(
         f"Компания {m['company']}, группа {m['group']}: "
         f"прогноз Q{m['q_now']}->Q{m['q_next']} "
-        f"(сезонный множитель объёма {m['seas_ratio']}, "
-        f"демпфер рычага k={m['lever_k']})"
+        f"(сезонность {m.get('seasonality', 'none')}×{m['seas_ratio']}, "
+        f"демпфер рычага k={m['lever_k']}{mode_note})"
     )
+    if m.get("mode") == "auto" and "разрыв_доли" in df:
+        flagged = df[
+            df["разрыв_доли"].notna()
+            & ((df["разрыв_доли"] < 0.6) | (df["разрыв_доли"] > 1.7))
+        ]
+        if len(flagged):
+            cells = ", ".join(
+                f"{r['канал']}{r['продукт']}" for _, r in flagged.iterrows()
+            )
+            print(
+                f"ℹ Авто-режим: ячейки вне равновесия (разрыв доли далёк от 1, "
+                f"уровень сдвинут к модельной доле): {cells}. Разрыв<1 = фирма "
+                f"недобирает свою модельную долю (рамп/вход)."
+            )
     if m.get("mode") == "history":
         print(
             "⚠ 1-я итерация: своих долей рынка нет (history-рамп). Бейзлайн = "
@@ -321,13 +387,20 @@ def _print_per_cell(pc: pd.DataFrame) -> None:
 
 def _cmd_backtest(a: argparse.Namespace) -> None:
     summary, df = backtest(
-        a.reports, a.train or None, a.history or None, lever_k=a.lever_k
+        a.reports,
+        a.train or None,
+        a.history or None,
+        lever_k=a.lever_k,
+        mode=a.mode,
+        gap_tau=a.gap_tau,
+        seasonality=a.seasonality,
     )
     s = summary
     print(
         f"Бэктест: {s['n_переходов']} переходов, {s['n_ячеек']} ячеек | "
         f"группы {s['группы']}, компании {s['компании']} | "
-        f"сезонность: {'да' if s['сезонность'] else 'нет'}"
+        f"сезонность: {s['сезонность_ист']} | "
+        f"режим: {s['режим']}"
     )
     print("Стадия 1 — доля (MAE, п.п.):")
     print(f"  своя, realistic:    {_fmt(s['доля_MAE_своя_real'])}")

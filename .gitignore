@@ -4,8 +4,9 @@
 # LibreOffice edit artifacts
 .~lock.*#
 
-# Forecast scenario file
-scenario.json
+# Forecasts
+forecast.csv
+forecast.coef.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
