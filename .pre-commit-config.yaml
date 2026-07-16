@@ -9,3 +9,10 @@ repos:
       language: system
       types: [python]
       require_serial: true
+    - id: openspec-archive
+      name: archive завершённые OpenSpec changes
+      entry: scripts/archive-complete-changes.sh
+      language: script
+      pass_filenames: false
+      always_run: true
+      require_serial: true
