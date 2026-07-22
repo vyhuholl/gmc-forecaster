@@ -166,6 +166,12 @@ def load_panel(paths: list[str]) -> pd.DataFrame:
                         }
                     )
     df = pd.DataFrame(rows)
+    # Числовая нормализация: пустая/текстовая ячейка 'W' -> NaN. Без неё панель
+    # ИЗ ОДНОГО файла, где колонка пуста целиком (финальный отчёт партии не
+    # выгружает рекламу и рейтинг), получает dtype=object, и np.log в _design
+    # падает на питоновском int ('int' object has no attribute 'log').
+    for c in ("price", "share", "adspend", "rating"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
     # внешняя опция: доля непокрытого рынка в ячейке (в процентах)
     tot = df.groupby(["gq", "cell"])["share"].transform("sum")
     df["share_out"] = 100.0 - tot
@@ -217,9 +223,19 @@ class ShareModel:
     def _design(self, d: pd.DataFrame) -> pd.DataFrame:
         X = pd.DataFrame(index=d.index)
         X["const"] = 1.0
-        X["log_price"] = np.log(d["price"].clip(lower=1))
-        X["log_adspend"] = np.log(d["adspend"].fillna(0).clip(lower=0) + 1)
-        X["rating"] = d["rating"].fillna(self._rating_mean)
+        X["log_price"] = np.log(
+            pd.to_numeric(d["price"], errors="coerce").clip(lower=1)
+        )
+        # Неизвестная реклама (отчёт её не выгружает) — это НЕ ноль: log(0+1)=0
+        # обвалило бы привлекательность у ВСЕХ компаний ячейки сразу, а логит
+        # Берри не ренормирует доли к 100 -> ячейка уехала бы во внешнюю опцию
+        # (замер на финальном отчёте: 0.02% против факта 12%). Подставляем
+        # среднее log(реклама+1) обучения — так же, как для рейтинга.
+        ad = pd.to_numeric(d["adspend"], errors="coerce").clip(lower=0)
+        X["log_adspend"] = np.log(ad + 1).fillna(self._ladspend_mean)
+        X["rating"] = pd.to_numeric(d["rating"], errors="coerce").fillna(
+            self._rating_mean
+        )
         for c in self._cellcols:
             X[c] = (d["cell"] == c.replace("cell_", "")).astype(float)
         for g in self._grpcols:
@@ -277,7 +293,22 @@ class ShareModel:
 
     def fit(self, df: pd.DataFrame) -> ShareModel:
         d = df[(df["share"] > 0) & (df["share_out"] > 0)].copy()
-        self._rating_mean = d["rating"].mean()
+        for c in ("adspend", "rating"):  # панель может прийти не из load_panel
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        # Строки с НЕИЗВЕСТНОЙ рекламой из фита исключаем: информации о
+        # β_adspend они не несут, а прежняя подстановка нуля учила модель на
+        # выдуманном «рекламы не было» (финальный отчёт партии не выгружает
+        # рекламу -> 72 такие строки на файл). На предсказании пропуск
+        # заменяется средним, см. _design. Если реклама не известна НИГДЕ —
+        # фильтр не применяем, иначе обучать будет не на чем.
+        ad_known = d["adspend"].notna()
+        self.n_no_adspend = int((~ad_known).sum())
+        if ad_known.any():
+            d = d[ad_known].copy()
+        rating_mean = float(d["rating"].mean())
+        self._rating_mean = rating_mean if math.isfinite(rating_mean) else 0.0
+        lad = float(np.log(d["adspend"].clip(lower=0) + 1).mean())
+        self._ladspend_mean = lad if math.isfinite(lad) else 0.0
         # фиксированные эффекты (drop_first -> базовая категория в const)
         self._cellcols = [f"cell_{c}" for c in sorted(d["cell"].unique())[1:]]
         self._grpcols = [

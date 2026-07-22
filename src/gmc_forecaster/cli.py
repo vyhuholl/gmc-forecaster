@@ -240,6 +240,11 @@ def _print_coeffs(df: pd.DataFrame, level: str) -> None:
         f"n={fit.get('n')} edf={fit.get('edf')} | ridge λ={ridge:.3g} "
         f"(усадка наклонов u_g к global; λ↑ = сильнее пулинг)"
     )
+    if fit.get("no_adspend"):
+        print(
+            f"  ! {fit['no_adspend']} строк --train без рекламы исключены из "
+            "обучения (отчёт её не выгружает)"
+        )
     blocks = _KEY_BLOCKS + (_FE_BLOCKS if level == "full" else [])
     view = cs[cs["блок"].isin(blocks)]
     print(f"  {'признак':<24}{'коэф':>8}{'ст.ош':>8}{'t':>7}{'p':>8}  знач")
@@ -402,6 +407,16 @@ def _cmd_backtest(a: argparse.Namespace) -> None:
         f"сезонность: {s['сезонность_ист']} | "
         f"режим: {s['режим']}"
     )
+    if s["строк_вне_фита_без_рекламы"]:
+        print(
+            f"! {s['строк_вне_фита_без_рекламы']} строк без рекламы исключены "
+            "из обучения модели доли (отчёт её не выгружает)"
+        )
+    if s["ячеек_реклама_с_Q_now"]:
+        print(
+            f"! в {s['ячеек_реклама_с_Q_now']} ячейках реклама/рейтинг Q_next "
+            "взяты с Q_now -> oracle там знает лишь фактические цены"
+        )
     print("Стадия 1 — доля (MAE, п.п.):")
     print(f"  своя, realistic:    {_fmt(s['доля_MAE_своя_real'])}")
     print(f"  своя, oracle:       {_fmt(s['доля_MAE_своя_oracle'])}")

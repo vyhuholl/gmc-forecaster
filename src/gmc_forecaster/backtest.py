@@ -24,6 +24,11 @@ per-cell/имидж-реклама) в FEATURES не входят -> их вли
     качество функции доли (верхняя граница точности).
 Разрыв между режимами = цена незнания ходов конкурентов.
 
+Если отчёт Q_{t+1} не выгружает рекламу/рейтинг (так устроен финальный отчёт
+партии), они переносятся с Q_t (_carry_forward), и oracle в этих ячейках —
+«oracle по ценам». Счётчик таких ячеек — в сводке (ячеек_реклама_с_Q_now).
+Realistic это не задевает: он и так берёт панель Q_t.
+
 Оговорка: стадия-1 обучается in-sample (модель доли фитится на --train, по
 умолчанию = все --reports). Это тест «фит + перенос вперёд», не строгий OOS;
 для честного OOS передай в --train только чужие группы/кварталы.
@@ -181,6 +186,31 @@ def _panel_own_adspend(cell: pd.DataFrame, company: int) -> float | None:
     return _fin(row["adspend"].iloc[0]) if len(row) else None
 
 
+def _carry_forward(
+    next_cell: pd.DataFrame, cur_cell: pd.DataFrame
+) -> tuple[pd.DataFrame, bool]:
+    """Подставляет в ячейку Q_next отсутствующие рекламу/рейтинг значениями той
+    же компании из Q_now. Финальный отчёт партии этих полей не выгружает, а
+    oracle подаёт панель Q_next целиком: без подстановки log(реклама+1)=0 у всех
+    восьми компаний, и т.к. логит Берри не ренормирует доли к 100, ячейка
+    уезжает во внешнюю опцию (замер: 0.02% против факта 12%). С подстановкой
+    oracle честнее назвать «oracle по ценам»: ходы конкурентов по цене
+    фактические, рекламные — замороженные на Q_now.
+    Возвращает (ячейка, была_ли_подстановка)."""
+    c = next_cell.copy()
+    filled = False
+    for col in ("adspend", "rating"):
+        miss = c[col].isna()
+        if not miss.any():
+            continue
+        src = cur_cell.drop_duplicates("company").set_index("company")[col]
+        vals = c.loc[miss, "company"].map(src)
+        if vals.notna().any():
+            c.loc[miss, col] = vals
+            filled = True
+    return c, filled
+
+
 def _anchor_demand(
     demand_now: float | None,
     seas_ratio: float,
@@ -235,6 +265,7 @@ def backtest(
 
     detail: list[dict[str, Any]] = []
     share_err_all: list[float] = []  # |доля_oracle − факт| по всем 8 компаниям
+    n_carried = 0  # ячеек, где реклама/рейтинг Q_next взяты с Q_now
 
     for cur, m, nxt in pairs:
         company = int(m["company"])
@@ -256,6 +287,11 @@ def backtest(
                     (panel_next["channel"] == ch)
                     & (panel_next["product"] == p)
                 ]
+                # реклама/рейтинг Q_next могут быть не выгружены (финальный
+                # отчёт) -> тянем их с Q_now, иначе oracle схлопнет ячейку
+                next_cell, carried = _carry_forward(next_cell, cur_cell)
+                if carried:
+                    n_carried += 1
 
                 # стадия 1, oracle по всем 8 компаниям (фит логита на факте Q_next)
                 nc = next_cell.dropna(subset=["price"])
@@ -371,6 +407,11 @@ def backtest(
         "сезонность": seas is not None,
         "сезонность_ист": seas_src,
         "режим": mode,
+        # ячейки, где реклама/рейтинг Q_next не выгружены и взяты с Q_now:
+        # oracle там знает фактические ЦЕНЫ, но не рекламу конкурентов
+        "ячеек_реклама_с_Q_now": n_carried,
+        # строки панели без рекламы, исключённые из обучения модели доли
+        "строк_вне_фита_без_рекламы": model.n_no_adspend,
         # стадия 1 — доля, MAE в процентных пунктах
         "доля_MAE_своя_real": _mae(col("доля_real"), col("доля_факт")),
         "доля_MAE_своя_oracle": _mae(col("доля_oracle"), col("доля_факт")),
