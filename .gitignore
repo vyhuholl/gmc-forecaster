@@ -7,6 +7,8 @@
 # Forecasts
 forecast.csv
 forecast.coef.csv
+backtest.csv
+cost.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
