@@ -55,7 +55,8 @@ from .model import (
     cell_volume,
     damp_lever,
     level_factor,
-    gap_weight,
+    anchor_weight,
+    gap_history,
     LEVER_K,
     GAP_TAU,
     CH,
@@ -201,6 +202,17 @@ def forecast(
         )
 
     cur_panel = load_panel([current])
+    # хронология разрыва доли своей серии (кварталы ДО текущего) — по ней
+    # авто-режим оценивает ПЕРСИСТЕНТНОСТЬ разрыва (см. model.gap_persistence).
+    # Своих прошлых отчётов в --train нет -> история пуста -> откат на уровневый
+    # приор gap_weight (прежнее поведение).
+    gap_hist = gap_history(
+        model,
+        [*train, current],
+        int(meta["group"]),
+        company,
+        before=int(meta["year"]) * 4 + q_now,
+    )
 
     # решения игрока с первого листа 'Your decisions' файла --current
     dec = parse_decisions(current)
@@ -309,22 +321,19 @@ def forecast(
                 float(orow["demand"]) if pd.notna(orow["demand"]) else None
             )
             # АВТО-УРОВЕНЬ ДОЛИ: разрыв gap = набл_доля/доля_база (sh_base).
-            # gap≈1 → якорь; gap далёк → фирма вне режима (рамп) → сдвиг уровня
-            # к модельной доле. factor=1 в anchored и когда доли нет.
+            # Разрыв ПЕРСИСТЕНТЕН (устойчив по своей истории) → якорь; разрыв
+            # схлопывается к 1 (рамп/вход) → сдвиг уровня к модельной доле.
+            # factor=1 в anchored и когда доли нет.
             gap = (
                 (share_now / sh_base)
                 if share_now and sh_base and share_now > 0 and sh_base > 0
                 else None
             )
-            lvl = level_factor(share_now, sh_base, mode, gap_tau)
+            hist = gap_hist.get(key)
+            lvl = level_factor(share_now, sh_base, mode, gap_tau, hist)
             # вес доверия якорю (наблюдаемому спросу): anchored=1, absolute=0,
-            # auto=gap_weight (по клипованному разрыву, как в level_factor)
-            if mode == "anchored" or gap is None:
-                w = 1.0
-            elif mode == "absolute":
-                w = 0.0
-            else:
-                w = gap_weight(min(max(gap, 0.1), 10.0), gap_tau)
+            # auto = персистентность разрыва по своей истории
+            w = anchor_weight(share_now, sh_base, mode, gap_tau, hist)
             # ЯКОРЬ: база = наблюдаемый спрос × сезонность × авто-уровень.
             # Наблюдаемый спрос несёт firm×cell-гетерогенность (её логит доли не
             # восстанавливает); авто-уровень сдвигает к модельной доле на рампе.
@@ -371,6 +380,9 @@ def forecast(
         lever_k=lever_k,
         mode=mode,
         gap_tau=gap_tau,
+        # глубина истории разрыва доли (кварталов своей серии в --train);
+        # 0 -> вес якоря по уровневому приору, динамику оценить не на чем
+        gap_hist=max((len(v) for v in gap_hist.values()), default=0),
     )
     # диагностика стадии 1: коэффициенты доли + значимость и качество подгонки
     df.attrs["coef_summary"] = model.coef_summary()

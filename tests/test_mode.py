@@ -1,7 +1,9 @@
 """Тесты авто-выбора уровня доли (anchored ↔ absolute) по разрыву gap.
 
-gap = набл_доля/доля_база: gap≈1 → якорь (наблюдаемый спрос персистентен),
-gap далёк от 1 → фирма вне режима (рамп) → сдвиг уровня к модельной доле.
+gap = набл_доля/доля_база. Авто-режим доверяет якорю ровно настолько, насколько
+разрыв ПЕРСИСТЕНТЕН по своей истории (gap_persistence): устойчивый разрыв →
+якорь, разрыв, схлопывающийся к 1 (рамп/вход) → сдвиг уровня к модельной доле.
+Без истории (первый квартал) — откат на уровневый приор gap_weight.
 """
 
 from __future__ import annotations
@@ -12,6 +14,8 @@ import pandas as pd
 import pytest
 from gmc_forecaster.model import (
     gap_weight,
+    gap_persistence,
+    anchor_weight,
     level_factor,
     GAP_TAU,
     MODES,
@@ -53,6 +57,56 @@ def test_gap_weight_tau_monotone() -> None:
 @pytest.mark.parametrize("bad", [None, 0.0, -1.0])
 def test_gap_weight_guards(bad: float | None) -> None:
     assert gap_weight(bad) == 1.0
+
+
+# --- gap_persistence: авто-вес по ДИНАМИКЕ разрыва --------------------------
+def test_persistence_no_history_falls_back_to_prior() -> None:
+    """Меньше двух разрывов → чистый уровневый приор gap_weight(текущий)."""
+    assert gap_persistence([0.3]) == pytest.approx(gap_weight(0.3))
+    assert gap_persistence([]) == 1.0
+
+
+def test_persistence_stable_gap_trusts_anchor() -> None:
+    """Устойчивый разрыв 0.3 (не рамп) → w высокий (якорь), несмотря на то что
+    уровневый приор в одиночку дал бы низкий вес."""
+    w = gap_persistence([0.30, 0.28, 0.31, 0.30])
+    assert w > 0.9
+    assert w > gap_weight(0.30)  # динамика бьёт уровневый приор
+
+
+def test_persistence_ramp_trusts_model() -> None:
+    """Рамп: разрыв летит к 1 (0.3→1.2→1.1) → w низкий (модель)."""
+    assert gap_persistence([0.32, 1.21, 1.09]) < 0.3
+
+
+def test_persistence_clipped_to_unit_interval() -> None:
+    """w клипуется в [0,1]: усиление разрыва → 1, перескок через 1 → 0."""
+    assert gap_persistence([2.0, 4.0, 8.0]) == pytest.approx(1.0, abs=0.05)
+    assert 0.0 <= gap_persistence([0.2, 5.0]) <= 1.0
+
+
+def test_anchor_weight_uses_history() -> None:
+    """anchor_weight(auto) с историей устойчивого разрыва → якорь; без истории
+    тот же текущий разрыв даёт низкий вес (уровневый приор)."""
+    hist = [0.30, 0.28, 0.31]
+    w_hist = anchor_weight(0.9, 3.0, "auto", gap_hist=hist)  # gap=0.3
+    w_bare = anchor_weight(0.9, 3.0, "auto")
+    assert w_hist > 0.9 > w_bare
+
+
+def test_anchor_weight_modes() -> None:
+    assert anchor_weight(1.0, 5.0, "anchored") == 1.0
+    assert anchor_weight(1.0, 5.0, "absolute") == 0.0
+    assert anchor_weight(None, 5.0, "auto") == 1.0
+
+
+def test_level_factor_history_stabilizes_persistent_gap() -> None:
+    """Устойчивый разрыв 0.3 с историей → фактор ≈ 1 (якорь), тогда как без
+    истории тот же разрыв поднимал уровень к модели (фактор ≫ 1)."""
+    f_hist = level_factor(0.9, 3.0, "auto", gap_hist=[0.30, 0.28, 0.31])
+    f_bare = level_factor(0.9, 3.0, "auto")
+    assert f_hist == pytest.approx(1.0, abs=0.15)
+    assert f_bare > 2.0
 
 
 # --- level_factor: множитель к заякоренной базе ------------------------------
@@ -153,3 +207,56 @@ def test_gap_weight_clip_matches_forecast_bound() -> None:
     w = gap_weight(0.1)
     assert level_factor(0.05, 5.0, "auto") == pytest.approx(0.1 ** (w - 1.0))
     assert not math.isinf(level_factor(1e-6, 5.0, "auto"))
+
+
+# --- извлечение истории разрыва: gap_panel / gaps_before --------------------
+# гр.15 к.2 — зрелая фирма с УСТОЙЧИВО слабой АСЕАН (разрыв ≈0.3, не рамп).
+# train включает свою серию (W172) — как в реальной команде backtest.
+G15 = glob.glob(str(ROOT / "data" / "W152*.xls"))
+TRAIN15 = TRAIN + glob.glob(str(ROOT / "data" / "W172*.xls"))
+
+
+@pytest.mark.skipif(not (G15 and TRAIN15), reason="нет отчётов гр.15")
+def test_gap_panel_and_gaps_before() -> None:
+    """gap_panel собирает хронологию разрыва по своей серии; gaps_before
+    отдаёт кварталы СТРОГО раньше t (защита бэктеста от заглядывания вперёд)."""
+    from gmc_forecaster.model import (
+        ShareModel,
+        load_panel,
+        gap_panel,
+        gaps_before,
+    )
+
+    model = ShareModel().fit(load_panel(TRAIN15))
+    panel = gap_panel(model, G15)
+    assert not panel.empty
+    assert set(panel.columns) == {"group", "company", "t", "cell", "gap"}
+    # гр.15 к.2 АСЕАН3 — устойчиво слабая ячейка: все разрывы заметно <1
+    a3 = panel[(panel["cell"] == "ASEAN3") & (panel["company"] == 2)]
+    assert (a3["gap"] < 0.7).all()
+    # отсечка по времени: до самого раннего квартала истории нет
+    tmin = int(panel["t"].min())
+    assert gaps_before(panel, 15, 2, tmin) == {}
+    before_last = gaps_before(panel, 15, 2, int(panel["t"].max()))
+    assert len(before_last.get("ASEAN3", [])) >= 1
+
+
+@pytest.mark.skipif(not (G15 and TRAIN15), reason="нет отчётов гр.15")
+def test_backtest_history_fixes_persistent_gap_cell() -> None:
+    """Регрессия: устойчиво слабая ASEAN3 гр.15 (разрыв ≈0.3 три квартала) при
+    авто-режиме с историей заякоривается, а не поднимается к модели в ×3.
+    Прежний уровневый auto давал спрос-MAPE по этой ячейке ~148%, а по агрегату
+    проваливался ниже сезонного наива (32.8% против 20.6%)."""
+    from gmc_forecaster.backtest import backtest, per_cell_summary
+
+    summ, df = backtest(G15, TRAIN15, [], mode="auto", seasonality="market")
+    assert summ["история_разрыва_кв"] >= 2
+    pc = per_cell_summary(df)
+    a3 = pc[(pc["канал"] == "ASEAN") & (pc["продукт"] == 3)].iloc[0]
+    # заякоренный уровень → ошибка спроса умеренная (прежний auto: ~148%)
+    assert float(a3["спрос_MAPE_real"]) < 30.0
+    # авто с историей ≈ anchored и заметно ниже прежнего уровневого auto
+    anc = backtest(G15, TRAIN15, [], mode="anchored", seasonality="market")[0]
+    assert summ["спрос_MAPE_real"] < 1.15 * anc["спрос_MAPE_real"]
+    # агрегат больше не проваливается ниже сезонного наива
+    assert summ["спрос_MAPE_real"] < summ["спрос_MAPE_seasnaive"]

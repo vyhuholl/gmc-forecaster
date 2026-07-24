@@ -47,6 +47,9 @@ from .model import (
     cell_volume,
     damp_lever,
     level_factor,
+    own_share,
+    gap_panel,
+    gaps_before,
     LEVER_K,
     GAP_TAU,
 )
@@ -150,32 +153,6 @@ def _series(reports: list[str]) -> list[tuple[str, dict[str, Any], str]]:
     return pairs
 
 
-def _own_share(
-    model: ShareModel,
-    cell: pd.DataFrame,
-    company: int,
-    price: float | None = None,
-    adspend: float | None = None,
-) -> float | None:
-    """Предсказанная доля (%) своей компании в ячейке. price/adspend — опц.
-    переопределение своих рычагов (остальные компании как в cell)."""
-    c = cell.dropna(subset=["price"]).copy()
-    mask = c["company"] == company
-    if not mask.any():
-        return None
-    c["price"] = c["price"].astype(float)
-    c["adspend"] = c["adspend"].astype(float)
-    if price is not None:
-        c.loc[mask, "price"] = float(price)
-    if adspend is not None:
-        c.loc[mask, "adspend"] = float(adspend)
-    shares = model.predict_shares(c)
-    own = shares[mask.to_numpy()]
-    if len(own) == 0:
-        return None
-    return _fin(own[0])
-
-
 def _own_val(df: pd.DataFrame, ch: str, p: int, col: str) -> float | None:
     row = df[(df["channel"] == ch) & (df["product"] == p)]
     return _fin(row[col].iloc[0]) if len(row) else None
@@ -221,15 +198,17 @@ def _anchor_demand(
     share_now: float | None = None,
     mode: str = "auto",
     gap_tau: float = GAP_TAU,
+    gap_hist: list[float] | None = None,
 ) -> float | None:
     """Заякоренный прогноз спроса: наблюдаемый спрос_Q_now × сезонность × рычаг
     × авто-уровень. Рычаг = модельное отношение доли (сцен/база), демпфированное
     lever_k (1.0 = полный, 0.0 = сезонный наив). Наблюдаемый спрос несёт
     firm×cell-гетерогенность, которую логит доли не восстанавливает; авто-уровень
-    (level_factor по разрыву набл/база) сдвигает уровень к модельной доле на
-    рампе. Нет наблюдаемого спроса -> откат на абсолютный прогноз доля×объём."""
+    (level_factor по персистентности разрыва набл/база) сдвигает уровень к
+    модельной доле на рампе. gap_hist — разрывы ячейки за кварталы ДО Q_now.
+    Нет наблюдаемого спроса -> откат на абсолютный прогноз доля×объём."""
     lev = damp_lever((sh / sh_base) if sh and sh_base else 1.0, lever_k)
-    lvl = level_factor(share_now, sh_base, mode, gap_tau)
+    lvl = level_factor(share_now, sh_base, mode, gap_tau, gap_hist)
     if demand_now is not None:
         return demand_now * seas_ratio * lev * lvl
     if sh is not None and vol_pred is not None:
@@ -262,16 +241,27 @@ def backtest(
     seas, seas_src = resolve_seasonality(
         seasonality, train or reports, history or []
     )
+    # хронология разрыва доли по всем сериям — для авто-веса якоря по ДИНАМИКЕ
+    # разрыва (см. model.gap_persistence). Считается один раз; на каждой паре
+    # берётся срез строго ДО Q_now, поэтому заглядывания вперёд нет.
+    gaps = gap_panel(model, [*reports, *(train or [])])
 
     detail: list[dict[str, Any]] = []
     share_err_all: list[float] = []  # |доля_oracle − факт| по всем 8 компаниям
     n_carried = 0  # ячеек, где реклама/рейтинг Q_next взяты с Q_now
+    n_gap_hist = 0  # макс. глубина истории разрыва (кварталов), для сводки
 
     for cur, m, nxt in pairs:
         company = int(m["company"])
         q_now, group = int(m["quarter"]), int(m["group"])
         q_next = int(parse_report(nxt)[0]["quarter"])
         seas_ratio = (seas[q_next] / seas[q_now]) if seas else 1.0
+        hist_gaps = gaps_before(
+            gaps, group, company, int(m["year"]) * 4 + q_now
+        )
+        n_gap_hist = max(
+            n_gap_hist, max((len(v) for v in hist_gaps.values()), default=0)
+        )
 
         panel_cur = load_panel([cur])
         panel_next = load_panel([nxt])
@@ -326,11 +316,12 @@ def backtest(
                 )
 
                 # доля (стадия 1) — оба режима, по своей компании
-                sh_base = _own_share(model, cur_cell, company)  # Q_now
-                sh_real = _own_share(
+                sh_base = own_share(model, cur_cell, company)  # Q_now
+                sh_real = own_share(
                     model, cur_cell, company, price_next, adspend_next
                 )
-                sh_orc = _own_share(model, next_cell, company)
+                sh_orc = own_share(model, next_cell, company)
+                gap_hist = hist_gaps.get(f"{ch}{p}")
 
                 # сквозной спрос — ЗАЯКОРЕННЫЙ: спрос_Q_now × сезонность × рычаг
                 # (рычаг = доля_сцен/доля_база). Абсолютный доля×объём (старый
@@ -345,6 +336,7 @@ def backtest(
                     share_now,
                     mode,
                     gap_tau,
+                    gap_hist,
                 )
                 d_orc = _anchor_demand(
                     demand_now,
@@ -356,6 +348,7 @@ def backtest(
                     share_now,
                     mode,
                     gap_tau,
+                    gap_hist,
                 )
                 # бейзлайны
                 d_persist = demand_now
@@ -407,6 +400,9 @@ def backtest(
         "сезонность": seas is not None,
         "сезонность_ист": seas_src,
         "режим": mode,
+        # глубина истории разрыва доли (кварталов): 0 -> авто-вес якоря везде
+        # падает на уровневый приор gap_weight, динамику разрыва оценить не на чем
+        "история_разрыва_кв": n_gap_hist,
         # ячейки, где реклама/рейтинг Q_next не выгружены и взяты с Q_now:
         # oracle там знает фактические ЦЕНЫ, но не рекламу конкурентов
         "ячеек_реклама_с_Q_now": n_carried,

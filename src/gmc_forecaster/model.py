@@ -28,6 +28,8 @@
 
 from __future__ import annotations
 import math
+from collections.abc import Sequence
+from typing import Any
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
@@ -44,7 +46,13 @@ __all__ = [
     "predict_demand",
     "damp_lever",
     "gap_weight",
+    "gap_persistence",
+    "anchor_weight",
     "level_factor",
+    "own_share",
+    "gap_panel",
+    "gaps_before",
+    "gap_history",
     "LEVER_K",
     "GAP_TAU",
     "MODES",
@@ -79,11 +87,23 @@ def damp_lever(ratio: float, k: float) -> float:
 # firm×cell-гетерогенность персистентна (зрелая фирма). На РАМПЕ/входе
 # наблюдаемая доля сильно ниже модельной (доля_база) и якорь замораживает
 # транзиент → сильное занижение (см. docs/FINDINGS.md, half-final gr.17).
-# Признак — разрыв gap = набл_доля/доля_база: gap≈1 равновесие (доверяй якорю),
-# gap далёк от 1 — фирма вне режима (доверяй модели). Бленд одним множителем к
-# заякоренной базе: factor = gap^(w−1), где w∈[0,1] — «персистентность разрыва».
-#   w=1 (gap≈1) → factor=1                 → anchored (без изменений)
-#   w=0 (gap далёк) → factor=доля_база/набл → absolute (доля_модель × рынок)
+# Признак — разрыв gap = набл_доля/доля_база. Бленд одним множителем к
+# заякоренной базе: factor = gap^(w−1), где w∈[0,1] — ПЕРСИСТЕНТНОСТЬ разрыва:
+#   w=1 → factor=1                 → anchored (разрыв сохранится)
+#   w=0 → factor=доля_база/набл    → absolute (разрыв схлопнется, доля×рынок)
+# То есть w — ровно коэффициент авторегрессии разрыва: ln gap_{t+1} = w·ln gap_t.
+#
+# ОТКУДА БЕРЁТСЯ w. Есть история своей серии (≥2 квартала) → оцениваем w прямо
+# по ней (gap_persistence): персистентная гетерогенность (фирма стабильно слаба
+# в канале) даёт w≈1 → якорь, рамп (gap летит к 1) даёт w≈0 → модель. Истории
+# нет (первый квартал, вход) → откат на УРОВНЕВЫЙ приор gap_weight: gap≈1
+# считаем равновесием, далёкий gap — выходом из режима.
+# Уровневый приор один, без истории, СИСТЕМАТИЧЕСКИ путает эти два случая:
+# фирма с устойчивым разрывом 0.3 (модель просто не знает её ячейку — firm-FE
+# один на фирму, не на firm×cell) получала якорь-вес ~0.05 и прогноз ×3
+# (замер: гр.15 к.2 АСЕАН3, спрос-MAPE 148%). Разводит их только динамика:
+#   гр.15 к.2 АСЕАН3 (не рамп): gap 0.48 0.30 0.32 → w→1  (якорь)
+#   гр.17 к.2 АСЕАН3 (рамп):    gap 0.32 1.21 1.09 → w→0  (модель)
 GAP_TAU = (
     0.5  # ширина толерантности к |ln gap| (в лог-долях); ↑ → ближе к якорю
 )
@@ -93,12 +113,84 @@ SEASONALITY = ("auto", "market", "history", "none")
 
 
 def gap_weight(gap: float | None, tau: float = GAP_TAU) -> float:
-    """Вес персистентности разрыва доли w∈(0,1]: гауссиана по ln(gap).
+    """УРОВНЕВЫЙ приор персистентности разрыва w∈(0,1]: гауссиана по ln(gap).
     w=1 при gap=1 (равновесие → якорь), убывает по мере отклонения gap от 1
-    (фирма вне режима → модель). tau — толерантность в лог-долях."""
+    (фирма предположительно вне режима → модель). tau — толерантность в
+    лог-долях. Используется, когда истории разрыва нет (см. gap_persistence)."""
     if gap is None or gap <= 0 or tau <= 0:
         return 1.0
     return math.exp(-(math.log(gap) ** 2) / (2.0 * tau * tau))
+
+
+def _clip_gaps(gaps: Sequence[float | None]) -> list[float]:
+    """Валидные разрывы (>0, конечные), клипованные до GAP_CLIP, в порядке
+    поступления (хронологически, последний = текущий)."""
+    out: list[float] = []
+    for x in gaps:
+        if x is None:
+            continue
+        v = float(x)
+        if not math.isfinite(v) or v <= 0:
+            continue
+        out.append(min(max(v, GAP_CLIP[0]), GAP_CLIP[1]))
+    return out
+
+
+def gap_persistence(
+    gaps: Sequence[float | None], tau: float = GAP_TAU
+) -> float:
+    """Персистентность разрыва доли w∈[0,1] по ЕГО ДИНАМИКЕ в своей серии.
+    gaps — хронология разрывов ячейки (последний = текущий квартал).
+
+    w — коэффициент авторегрессии без константы, ln gap_{t+1} = w·ln gap_t,
+    оценённый МНК по парам смежных кварталов и усаженный (ridge) к уровневому
+    приору gap_weight(текущий gap) с силой λ=tau² («приор весит один квартал с
+    |ln gap|=tau»). Усадка нужна, когда разрывы близки к 1: там Σln²gap→0,
+    голая регрессия вырождается, а сам множитель gap^(w−1)≈1 и почти не зависит
+    от w. Меньше двух валидных разрывов (первый квартал серии) → чистый приор.
+    Результат клипуется в [0,1]: w>1 (разрыв усиливается) = якорь, w<0
+    (разрыв перескочил через 1) = модель."""
+    g = _clip_gaps(gaps)
+    if not g:
+        return 1.0
+    prior = gap_weight(g[-1], tau)
+    if len(g) < 2 or tau <= 0:
+        return prior
+    x = [math.log(v) for v in g[:-1]]  # ln gap_t
+    y = [math.log(v) for v in g[1:]]  # ln gap_{t+1}
+    lam = tau * tau
+    num = sum(a * b for a, b in zip(x, y)) + lam * prior
+    den = sum(a * a for a in x) + lam
+    return min(max(num / den, 0.0), 1.0)
+
+
+def _gap(share_now: float | None, share_base: float | None) -> float | None:
+    """Разрыв доли gap = набл/модель, клипованный до GAP_CLIP. Нет доли (или
+    ≤0) → None."""
+    if not share_now or not share_base or share_now <= 0 or share_base <= 0:
+        return None
+    return min(max(share_now / share_base, GAP_CLIP[0]), GAP_CLIP[1])
+
+
+def anchor_weight(
+    share_now: float | None,
+    share_base: float | None,
+    mode: str = "auto",
+    tau: float = GAP_TAU,
+    gap_hist: Sequence[float] | None = None,
+) -> float:
+    """Вес доверия якорю w∈[0,1]: anchored=1, absolute=0, auto —
+    персистентность разрыва (gap_persistence по gap_hist + текущий разрыв).
+    gap_hist — разрывы ПРЕДЫДУЩИХ кварталов той же ячейки (хронологически,
+    текущий НЕ включать; см. gap_history). Нет доли → 1.0 (откат на якорь)."""
+    if mode == "anchored":
+        return 1.0
+    gap = _gap(share_now, share_base)
+    if gap is None:
+        return 1.0
+    if mode == "absolute":
+        return 0.0
+    return gap_persistence([*(gap_hist or []), gap], tau)
 
 
 def level_factor(
@@ -106,23 +198,19 @@ def level_factor(
     share_base: float | None,
     mode: str = "auto",
     tau: float = GAP_TAU,
+    gap_hist: Sequence[float] | None = None,
 ) -> float:
     """Множитель к ЗАЯКОРЕННОЙ базе спроса, сдвигающий УРОВЕНЬ доли между
     наблюдаемым (anchored) и модельным (absolute) по разрыву gap=набл/база.
       anchored → 1.0 (якорь как есть)
       absolute → gap^(−1) = доля_база/набл (перевод уровня к модельной доле)
-      auto     → gap^(w−1), w=gap_weight(gap): равновесие=якорь, рамп=модель
+      auto     → gap^(w−1), w=anchor_weight: разрыв персистентен=якорь,
+                 схлопывается (рамп)=модель
     Нет наблюдаемой/модельной доли (или ≤0) → 1.0 (откат на якорь)."""
-    if (
-        mode == "anchored"
-        or not share_now
-        or not share_base
-        or share_now <= 0
-        or share_base <= 0
-    ):
+    gap = _gap(share_now, share_base)
+    if mode == "anchored" or gap is None:
         return 1.0
-    gap = min(max(share_now / share_base, GAP_CLIP[0]), GAP_CLIP[1])
-    w = 0.0 if mode == "absolute" else gap_weight(gap, tau)
+    w = anchor_weight(share_now, share_base, mode, tau, gap_hist)
     return float(gap ** (w - 1.0))
 
 
@@ -438,6 +526,112 @@ class ShareModel:
         if group is not None:
             coef += self.coef_.get(f"lp_g_{group}", 0.0)
         return float(coef) * (1 - share_pct / 100)
+
+
+# ---------- разрыв доли: модельная доля своей компании и его хронология ------
+def own_share(
+    model: ShareModel,
+    cell_df: pd.DataFrame,
+    company: int,
+    price: float | None = None,
+    adspend: float | None = None,
+) -> float | None:
+    """Предсказанная доля (%) своей компании в ячейке. price/adspend — опц.
+    переопределение своих рычагов (остальные компании как в cell_df)."""
+    c = cell_df.dropna(subset=["price"]).copy()
+    mask = c["company"] == company
+    if not mask.any():
+        return None
+    c["price"] = c["price"].astype(float)
+    c["adspend"] = c["adspend"].astype(float)
+    if price is not None:
+        c.loc[mask, "price"] = float(price)
+    if adspend is not None:
+        c.loc[mask, "adspend"] = float(adspend)
+    own = model.predict_shares(c)[mask.to_numpy()]
+    if len(own) == 0:
+        return None
+    v = float(own[0])
+    return v if math.isfinite(v) else None
+
+
+def gap_panel(model: ShareModel, paths: list[str]) -> pd.DataFrame:
+    """Панель разрывов доли gap = набл_доля/доля_база по всем сериям отчётов:
+    колонки group/company/t (=год·4+квартал)/cell ('EAEU1'..'INT3')/gap.
+    Доля_база считается по конкурентной ячейке ТОГО ЖЕ файла — как sh_base в
+    прогнозе, иначе разрывы несопоставимы. Строки без своей доли (её не
+    выгружает финальный отчёт) пропускаются; дубли (group, company, t, cell)
+    схлопываются."""
+    from .parser import parse_report
+
+    rows: list[dict[str, Any]] = []
+    for path in dict.fromkeys(paths):  # дедуп путей, порядок сохраняем
+        meta, own = parse_report(path)
+        try:
+            group, company = int(meta["group"]), int(meta["company"])
+        except TypeError, ValueError:
+            continue
+        t = int(meta["year"]) * 4 + int(meta["quarter"])
+        panel = load_panel([path])
+        for ch in CH:
+            for p in (1, 2, 3):
+                cell = panel[
+                    (panel["channel"] == ch) & (panel["product"] == p)
+                ]
+                orow = own[(own["channel"] == ch) & (own["product"] == p)]
+                if not len(orow):
+                    continue
+                sn = pd.to_numeric(orow["share_own"].iloc[0], errors="coerce")
+                base = own_share(model, cell, company)
+                if pd.isna(sn) or not base or float(sn) <= 0 or base <= 0:
+                    continue
+                rows.append(
+                    {
+                        "group": group,
+                        "company": company,
+                        "t": t,
+                        "cell": f"{ch}{p}",
+                        "gap": float(sn) / base,
+                    }
+                )
+    df = pd.DataFrame(
+        rows, columns=["group", "company", "t", "cell", "gap"]
+    ).drop_duplicates(subset=["group", "company", "t", "cell"])
+    return df.sort_values(["group", "company", "cell", "t"], ignore_index=True)
+
+
+def gaps_before(
+    panel: pd.DataFrame, group: int, company: int, t: int
+) -> dict[str, list[float]]:
+    """Срез gap_panel: хронология разрывов серии (group, company) по кварталам
+    СТРОГО раньше t. Отсечка защищает бэктест от заглядывания вперёд."""
+    d = panel[
+        (panel["group"] == group)
+        & (panel["company"] == company)
+        & (panel["t"] < t)
+    ]
+    return {
+        str(k): g.sort_values("t")["gap"].tolist()
+        for k, g in d.groupby("cell")
+    }
+
+
+def gap_history(
+    model: ShareModel,
+    paths: list[str],
+    group: int,
+    company: int,
+    before: int | None = None,
+) -> dict[str, list[float]]:
+    """Хронология разрыва доли по ячейкам своей серии: {'EAEU1': [gap, ...]}.
+    Отбирает из paths отчёты (group, company) с временем строго раньше before
+    (=год·4+квартал; None — все). Результат идёт в anchor_weight/level_factor
+    как gap_hist."""
+    panel = gap_panel(model, paths)
+    if panel.empty:
+        return {}
+    t = before if before is not None else int(panel["t"].max()) + 1
+    return gaps_before(panel, group, company, t)
 
 
 # ---------- Стадия 2: объём рынка ----------
